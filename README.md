@@ -36,6 +36,15 @@ single-threaded unless stated, `-C target-cpu=native`. GOPS = 2·M·N·K / s.
 | 1×4096×4096 *(decode)* | 47.83 | **63.94** | 38.35 | 46.18 | **0.72×** |
 | 8×4096×4096 | 47.71 | 256.15 | 144.14 | **369.09** | 1.44× |
 
+> **Two decimal places overstate the precision.** Re-running the table three
+> times, most cells move under 2% — 256³ SDOT reads 275.58 / 276.54 / 274.31 —
+> but the decode row is the loose one: SDOT at 1×4096×4096 gives 63.89 / 60.49 /
+> 58.71, an 8.8% spread, and the figure quoted above is the top of it. The M=1
+> ratio lands between 0.72× and 0.78× depending on run. **The conclusion is not
+> at risk** — every reading is far below parity — but the third digit is not
+> real, and the peak figures further down are quoted as a range for the same
+> reason.
+
 **Tiling is worth more than the instruction.** Register-tiling `SDOT` alone takes it
 from 93 to 275 GOPS — 3.0×. Choosing `SMMLA` over a tiled `SDOT` is worth 1.1×.
 Anyone optimising for this hardware should fix their tiles before they think about
