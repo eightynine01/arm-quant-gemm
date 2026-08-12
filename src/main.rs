@@ -193,19 +193,102 @@ fn main() {
 }
 
 /// What fraction of the machine are we actually using?
+///
+/// Two ceilings, not one. Reporting only the issue ceiling makes every
+/// memory-bound kernel look like it is squandering the machine.
 fn roofline_demo() {
     let (mm_ceiling, _) = unsafe { roofline::smmla_issue_ceiling(2_000_000) };
     let (dot_ceiling, _) = unsafe { roofline::sdot_issue_ceiling(2_000_000) };
+
+    // Measured live rather than quoted from the table above: a hardcoded kernel
+    // figure silently goes stale the moment the kernel changes, and a roofline
+    // built on a stale numerator is worse than none.
+    let (m, n, k) = (8usize, 4096usize, 4096usize);
+    let ops = 2.0 * m as f64 * n as f64 * k as f64;
+    let (mut a, mut b) = (vec![0i8; m * k], vec![0i8; k * n]);
+    fill(&mut a, 0x9E3779B97F4A7C15);
+    fill(&mut b, 0xBF58476D1CE4E5B9);
+    let mut c = vec![0i32; m * n];
+    let (pa, mp, kp) = pack_a_smmla(m, k, &a);
+    let (pb, np) = pack_b_smmla(n, k, &b);
+    let g_mm = bench_one(
+        || unsafe { gemm_smmla_8x8(m, n, mp, np, kp, &pa, &pb, &mut c) }, ops, 0.8);
+    let bt = pack_b_transposed(n, k, k, &b);
+    let g_dot = bench_one(
+        || unsafe { gemm_sdot_tiled(m, n, k, k, &a, &bt, &mut c) }, ops, 0.8);
+
     println!("\nSingle-core issue ceiling (register-resident, no memory traffic)");
     println!("┌──────────┬──────────────┬──────────────┬──────────┐");
     println!("│          │ ceiling GOPS │  kernel GOPS │ of peak  │");
     println!("├──────────┼──────────────┼──────────────┼──────────┤");
     println!("│ SMMLA    │ {:>12.1} │ {:>12.1} │ {:>7.1}% │",
-             mm_ceiling, 372.6, 372.6 / mm_ceiling * 100.0);
+             mm_ceiling, g_mm, g_mm / mm_ceiling * 100.0);
     println!("│ SDOT     │ {:>12.1} │ {:>12.1} │ {:>7.1}% │",
-             dot_ceiling, 256.2, 256.2 / dot_ceiling * 100.0);
+             dot_ceiling, g_dot, g_dot / dot_ceiling * 100.0);
     println!("└──────────┴──────────────┴──────────────┴──────────┘");
-    println!("Kernel figures are the 8x4096x4096 single-thread rows above.");
+    println!("Kernel figures measured here at {}x{}x{}, single thread.", m, n, k);
+
+    // The other ceiling. B for this shape is n*k = 16 MiB, so the level of the
+    // hierarchy that matters is whichever one a 16 MiB footprint lands in --
+    // hence the sweep rather than a single number.
+    println!("\nSingle-core load bandwidth by footprint");
+    println!("┌────────────┬──────────────┐");
+    println!("│  footprint │        GB/s  │");
+    println!("├────────────┼──────────────┤");
+    let mut bw_at_b = 0.0;
+    let b_bytes = n * k;
+    for &bytes in &[64 << 10, 4 << 20, 16 << 20, 256 << 20] {
+        let iters = ((20e9 / bytes as f64) as u64).max(1);
+        let (gbs, _) = roofline::stream_bandwidth(bytes, iters);
+        let label = if bytes >= (1 << 20) {
+            format!("{} MiB", bytes >> 20)
+        } else {
+            format!("{} KiB", bytes >> 10)
+        };
+        let mark = if bytes == b_bytes { "  <- B panel" } else { "" };
+        println!("│ {:>10} │ {:>12.1} │{}", label, gbs, mark);
+        if bytes == b_bytes {
+            bw_at_b = gbs;
+        }
+    }
+    println!("└────────────┴──────────────┘");
+
+    // A deleted benchmark loop reports an impossibly large number, not zero, and
+    // this one slipped through twice before the slope gave it away. No single
+    // core streams anywhere near a TB/s, so treat that as broken rather than
+    // building a roofline on it and printing a confident conclusion.
+    const IMPLAUSIBLE_GBS: f64 = 2000.0;
+    if !bw_at_b.is_finite() || bw_at_b > IMPLAUSIBLE_GBS {
+        println!(
+            "\nBandwidth measurement is not usable ({:.1} GB/s at the B panel).",
+            bw_at_b
+        );
+        println!("A single core cannot exceed ~{:.0} GB/s, so the loop was optimised", IMPLAUSIBLE_GBS);
+        println!("out. Skipping the memory ceiling rather than reporting a bogus one.");
+        return;
+    }
+
+    // intensity = 2 * mt ops/byte, derived in roofline.rs. The 8x8 kernel reads
+    // B once per 8 rows of A, so at m = 8 it reads B exactly once: this is the
+    // minimum traffic the shape allows, not a blocking failure.
+    let intensity = 16.0;
+    let mem_ceiling = bw_at_b * intensity;
+    let binding = mem_ceiling.min(mm_ceiling);
+    println!(
+        "\nSMMLA 8x8 at m={}: intensity {:.0} ops/byte (= 2 x tile rows)",
+        m, intensity
+    );
+    println!(
+        "  memory ceiling  {:.1} GB/s x {:.0} = {:>7.1} GOPS",
+        bw_at_b, intensity, mem_ceiling
+    );
+    println!("  issue ceiling                  = {:>7.1} GOPS", mm_ceiling);
+    println!(
+        "  binding ceiling {:>7.1} GOPS -> kernel is at {:.1}% of it ({})",
+        binding,
+        g_mm / binding * 100.0,
+        if mem_ceiling < mm_ceiling { "memory-bound" } else { "issue-bound" }
+    );
 }
 
 /// Show that dispatching on M wins in both regimes.
