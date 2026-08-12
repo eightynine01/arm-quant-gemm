@@ -312,9 +312,35 @@ At 8×4096×4096 the entire GEMM is ~0.3ms — the same order as spawning 16
 threads. This is a small-batch decode shape, which is exactly where the
 threading is supposed to help.
 
-The fix is a persistent pool rather than per-call spawn. **Not implemented
-here**: the measurement is reported, the remedy is not yet built, and quoting a
-speedup for something unbuilt is how the retracted claim above happened.
+### The fix, and what it confirms
+
+`Pool` creates its workers once and parks them on a channel. Same partition,
+same kernel, same everything — the only difference is where the threads come
+from:
+
+| threads | per-call spawn | persistent pool | gain |
+|---:|---:|---:|---:|
+| 4 | 1068.7 | 1215.9 | 1.14× |
+| 8 | 1269.4 | 2000.6 | 1.58× |
+| 12 | 1280.5 | **2307.8** | 1.80× |
+| 16 | 1054.9 | 2166.4 | 2.05× |
+| 24 | 819.9 | 2095.4 | **2.56×** |
+
+Bit-identical output at every thread count.
+
+**Peak goes from 1280 to 2308 GOPS, and the regression is gone** — the pool
+rises to 12 threads and then holds flat instead of collapsing. The gain grows
+with thread count exactly as the diagnosis predicts, because that is where the
+spawn cost was growing.
+
+Worth stating plainly: this is the check that the explanation was right. A
+hypothesis about a bottleneck earns belief when removing it moves the number,
+and the retracted memory-bound claim earlier on this page failed precisely that
+test — the k-unroll built to exploit it changed nothing, which is what sent me
+back to remeasure.
+
+2308 GOPS is 45% of `12 × 424` single-core issue ceilings, so the multi-threaded
+path is now bound by something shared rather than by thread management.
 
 ## What this is not
 

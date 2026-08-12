@@ -488,6 +488,111 @@ pub unsafe fn gemm_smmla_8x8_u2(
     smmla_8x8_colrange_u2(m, n, mp, kp, pa, pb, c, 0, np / 2);
 }
 
+/// Worker threads that outlive a single call.
+///
+/// `std::thread::scope` creates fresh OS threads every time it is entered. At
+/// `8x4096x4096` the whole GEMM is ~0.3ms and spawning 16 threads is ~0.16ms of
+/// that, so past roughly 8-12 threads the creation cost grows faster than the
+/// per-thread work shrinks and adding threads makes things slower. Measured in
+/// `thread_balance_demo()`.
+///
+/// The workers here are created once and parked on a channel.
+pub struct Pool {
+    txs: Vec<std::sync::mpsc::Sender<Job>>,
+    done: std::sync::mpsc::Receiver<()>,
+    n: usize,
+}
+
+/// A worker index and an erased pointer to the closure to run.
+struct Job(usize, *const (dyn Fn(usize) + Sync + 'static));
+
+/// Sound because [`Pool::run`] blocks until every worker has finished with the
+/// pointer, so the closure it borrows outlives the send. Nothing else can
+/// observe the pointer.
+unsafe impl Send for Job {}
+
+impl Pool {
+    pub fn new(n: usize) -> Self {
+        let n = n.max(1);
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let mut txs = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (tx, rx) = std::sync::mpsc::channel::<Job>();
+            let dt = done_tx.clone();
+            std::thread::spawn(move || {
+                // Exits when the Pool is dropped and the sender closes.
+                while let Ok(Job(idx, f)) = rx.recv() {
+                    unsafe { (*f)(idx) };
+                    if dt.send(()).is_err() {
+                        break;
+                    }
+                }
+            });
+            txs.push(tx);
+        }
+        Pool { txs, done, n }
+    }
+
+    pub fn threads(&self) -> usize {
+        self.n
+    }
+
+    /// Run `f(i)` on worker `i` for every worker, and block until all return.
+    ///
+    /// The lifetime erasure is the whole trick, and the blocking join below is
+    /// what makes it sound: `f` cannot be dropped while a worker still holds
+    /// the pointer, because this function does not return until every worker
+    /// has sent its completion.
+    ///
+    /// A panicking worker would leave this waiting forever. That is acceptable
+    /// here — the kernels are panic-free and a benchmark that hangs is more
+    /// honest than one that silently reports a partial result.
+    pub fn run<F: Fn(usize) + Sync>(&self, f: F) {
+        let borrowed: &(dyn Fn(usize) + Sync) = &f;
+        let erased: *const (dyn Fn(usize) + Sync + 'static) =
+            unsafe { std::mem::transmute(borrowed) };
+        for (i, tx) in self.txs.iter().enumerate() {
+            tx.send(Job(i, erased)).expect("pool worker died");
+        }
+        for _ in 0..self.n {
+            self.done.recv().expect("pool worker died");
+        }
+    }
+}
+
+/// `SMMLA` over a persistent pool. Same partition as [`gemm_smmla_mt`], so any
+/// difference between the two is thread management and nothing else.
+///
+/// # Safety
+/// Requires FEAT_I8MM. Same packing contract as [`gemm_smmla`].
+pub unsafe fn gemm_smmla_pool(
+    m: usize, n: usize, mp: usize, np: usize, kp: usize,
+    pa: &[i8], pb: &[i8], c: &mut [i32], pool: &Pool,
+) {
+    let colpairs = np / 2;
+    let nthreads = pool.threads().min(colpairs.max(1));
+    if nthreads <= 1 {
+        gemm_smmla_8x8(m, n, mp, np, kp, pa, pb, c);
+        return;
+    }
+    let cp_chunk = colpairs.div_ceil(nthreads);
+    let cptr = CPtr(c.as_mut_ptr());
+    let clen = c.len();
+
+    pool.run(|t| {
+        let cp0 = t * cp_chunk;
+        if cp0 >= colpairs {
+            return;
+        }
+        let cp1 = ((t + 1) * cp_chunk).min(colpairs);
+        let cptr = cptr;
+        unsafe {
+            let cslice = std::slice::from_raw_parts_mut(cptr.0, clen);
+            smmla_8x8_colrange(m, n, mp, kp, pa, pb, cslice, cp0, cp1);
+        }
+    });
+}
+
 /// Raw `*mut i32` that threads may hold concurrently.
 ///
 /// Sound only because every thread writes a disjoint set of C elements — the

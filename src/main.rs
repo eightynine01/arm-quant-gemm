@@ -279,6 +279,32 @@ fn thread_balance_demo() {
     }
     println!("└─────────┴───────────┘");
     println!("16 performance cores + 8 efficiency cores on this machine.");
+
+    // Does a persistent pool recover it?
+    println!("\nPersistent pool vs per-call spawn");
+    println!("┌─────────┬───────────┬───────────┬─────────┬─────────┐");
+    println!("│ threads │ spawn GOPS│  pool GOPS│  gain   │ correct │");
+    println!("├─────────┼───────────┼───────────┼─────────┼─────────┤");
+    let ops = 2.0 * m as f64 * n as f64 * k as f64;
+    for &nt in &[4usize, 8, 12, 16, 24] {
+        let pool = Pool::new(nt);
+        let mut c1 = vec![0i32; m * n];
+        let mut c2 = vec![0i32; m * n];
+        unsafe { gemm_smmla_mt(m, n, mp, np, kp, &pa, &pb, &mut c1, nt) };
+        unsafe { gemm_smmla_pool(m, n, mp, np, kp, &pa, &pb, &mut c2, &pool) };
+        let ok = c1 == c2;
+
+        let g_spawn = bench_one(
+            || unsafe { gemm_smmla_mt(m, n, mp, np, kp, &pa, &pb, &mut c1, nt) }, ops, 0.8);
+        let g_pool = bench_one(
+            || unsafe { gemm_smmla_pool(m, n, mp, np, kp, &pa, &pb, &mut c2, &pool) }, ops, 0.8);
+        println!(
+            "│ {:>7} │ {:>9.1} │ {:>9.1} │ {:>6.2}× │ {:>7} │",
+            nt, g_spawn, g_pool, g_pool / g_spawn,
+            if ok { "match" } else { "MISMATCH" }
+        );
+    }
+    println!("└─────────┴───────────┴───────────┴─────────┴─────────┘");
 }
 
 /// Does putting more loads in flight close any of the gap to the memory ceiling?
