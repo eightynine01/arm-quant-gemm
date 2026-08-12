@@ -78,6 +78,14 @@ which is what the 8×8 tile then fixed. `gemm_smmla_blocked` is still in the sou
 three rounds, and with both kernels tiled it is cleaner than it was in round 1 — the
 ratio is below parity everywhere rather than crossing over.
 
+> **Measured on the per-call-spawn harness**, which is 43–62% thread creation at
+> these sizes — see [Why 16 threads loses to 8](#why-16-threads-loses-to-8). The
+> 16-thread rows in particular are noise-dominated: the M=1 ratio reads 0.95×
+> here and 0.83× when re-run pooled, and the peak reads 1364.5 GOPS against
+> ~4400 on a spin barrier. Kept as measured, with the pooled re-run
+> [below](#re-checking-the-headline-claim-on-the-fixed-harness) — the finding
+> holds on both and gets sharper on the fixed one.
+
 The mechanism is structural. `SMMLA` always emits two output rows; at M=1 the second is
 padding, so half its arithmetic is discarded. Widening the tile makes that worse, not
 better — the 8×8 tile spans four row pairs, so at M=1 three of four are padding. It
