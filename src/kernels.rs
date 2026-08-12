@@ -204,6 +204,36 @@ pub fn choose(m: usize) -> Kernel {
     if m >= SMMLA_MIN_ROWS { Kernel::Smmla } else { Kernel::Sdot }
 }
 
+/// Blocked `SMMLA`: same arithmetic, different loop order.
+///
+/// [`gemm_smmla`] walks every column pair for one row pair before moving on, so
+/// it re-reads the whole A panel once per column pair. At 256³ the panels stay
+/// resident and that costs nothing; at 1024³ they do not, and throughput drops
+/// from ~202 to ~151 GOPS.
+///
+/// Blocking N means the A panel is loaded once per block and reused across the
+/// column pairs inside it, so the re-reads hit cache instead of memory.
+/// `NBLOCK` is in columns and is deliberately conservative — a packed B block of
+/// `NBLOCK × kp` bytes plus the A panel should sit inside L2.
+pub const NBLOCK: usize = 256;
+
+/// # Safety
+/// Requires FEAT_I8MM. Same packing contract as [`gemm_smmla`].
+#[target_feature(enable = "i8mm")]
+pub unsafe fn gemm_smmla_blocked(
+    m: usize, n: usize, mp: usize, np: usize, kp: usize,
+    pa: &[i8], pb: &[i8], c: &mut [i32],
+) {
+    let colpairs = np / 2;
+    let cp_block = (NBLOCK / 2).max(1);
+    let mut cp0 = 0;
+    while cp0 < colpairs {
+        let cp1 = (cp0 + cp_block).min(colpairs);
+        smmla_colrange(m, n, mp, kp, pa, pb, c, cp0, cp1);
+        cp0 = cp1;
+    }
+}
+
 /// Raw `*mut i32` that threads may hold concurrently.
 ///
 /// Sound only because every thread writes a disjoint set of C elements — the

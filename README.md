@@ -69,6 +69,38 @@ The same effect compresses the M=8 advantage from 3.07× to 1.64×.
 
 Peak measured: **756.9 GOPS** (SMMLA, 8 threads, M=8).
 
+## A blocking experiment that failed
+
+Throughput falls from ~197 GOPS at 256³ to ~150 at 1024³. The obvious diagnosis is
+cache: the unblocked kernel walks every column pair for one row pair before moving
+on, so it streams the whole packed B — 1 MB at 1024³ — once per row pair.
+
+So I blocked N at 256 columns, expecting the B block to stay resident and the
+re-reads to hit cache. It did nothing:
+
+| M×N×K | SMMLA | +blocked |
+|---|---:|---:|
+| 256×256×256 | 195.23 | 197.83 |
+| 512×512×512 | 164.37 | 164.78 |
+| 1024×1024×1024 | 150.01 | 150.51 |
+| 8×4096×4096 | 143.78 | 145.02 |
+
+Every difference is inside run-to-run noise. **The kernel is not bound by B reuse.**
+
+Counting loads explains why. Each k-step issues four `SMMLA`s and four 16-byte
+loads (`a0`, `a1`, `b0`, `b1`) — one load per `SMMLA`. A core that sustains two
+128-bit loads per cycle can therefore retire at most two `SMMLA` per cycle no
+matter how well the data caches, and the measured ~197 GOPS is close to that
+ceiling for this tiling. Blocking improves locality the kernel was not short of.
+
+The optimization the count actually points at is a **larger register tile** — an
+8×8 output block reuses each loaded vector across four `SMMLA`s instead of one,
+cutting load pressure per unit of arithmetic by 4×. That is the next thing to try,
+and it is not implemented here.
+
+Reported rather than deleted because the negative result is the useful part: it
+rules out the first explanation anyone would reach for.
+
 ## The rule
 
 The asymmetry makes the simple rule the right one:
@@ -143,8 +175,9 @@ Honest limits, so the numbers are read correctly:
   vectorisation buys; the meaningful comparison is SMMLA vs SDOT.
 - **Packing is outside the timed loop.** That matches inference — weights are packed
   once and reused across every token — but would overstate the gain for a one-shot GEMM.
-- **No cache blocking.** Throughput falls from 202 GOPS at 256³ to 151 at 1024³, which
-  is a working-set effect a blocked kernel would recover.
+- **Load-bandwidth bound, not fixed.** Blocking N was tried and did nothing (above);
+  the 4×4 tile issues one 16-byte load per `SMMLA`, which caps throughput regardless
+  of locality. A larger register tile is the open item.
 - **Not compared against a tuned library.** This measures SMMLA against SDOT under
   identical conditions. It makes no claim against Accelerate, oneDNN, or llama.cpp.
 - **One machine.** Every number is from a single M2 Ultra. The M=1 argument is

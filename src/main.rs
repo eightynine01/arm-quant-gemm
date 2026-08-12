@@ -36,6 +36,11 @@ fn run_all(m: usize, n: usize, k: usize) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
     let mut c_mm = vec![0i32; m * n];
     unsafe { gemm_smmla(m, n, mp, np, kp, &pa, &pb, &mut c_mm) };
 
+    // The blocked variant only reorders loops, so it must agree exactly.
+    let mut c_bl = vec![0i32; m * n];
+    unsafe { gemm_smmla_blocked(m, n, mp, np, kp, &pa, &pb, &mut c_bl) };
+    assert_eq!(c_bl, c_mm, "blocked SMMLA diverged at {}x{}x{}", m, n, k);
+
     (c_ref, c_dot, c_mm)
 }
 
@@ -125,9 +130,9 @@ fn main() {
     println!("All match. Benchmarking.\n");
 
     println!("Throughput (GOPS = 2*M*N*K / s, higher is better)");
-    println!("┌──────────────────┬──────────┬──────────┬──────────┬─────────┬─────────┐");
-    println!("│ M×N×K            │  scalar  │   SDOT   │  SMMLA   │ SDOT x  │ SMMLA x │");
-    println!("├──────────────────┼──────────┼──────────┼──────────┼─────────┼─────────┤");
+    println!("┌──────────────────┬──────────┬──────────┬──────────┬──────────┬─────────┐");
+    println!("│ M×N×K            │  scalar  │   SDOT   │  SMMLA   │ +blocked │ SMMLA x │");
+    println!("├──────────────────┼──────────┼──────────┼──────────┼──────────┼─────────┤");
 
     for &(m, n, k) in &[
         (256usize, 256usize, 256usize),
@@ -154,14 +159,18 @@ fn main() {
         let g_mm = bench_one(
             || unsafe { gemm_smmla(m, n, mp, np, kp, &pa, &pb, &mut c) }, ops, 1.0);
 
+        let g_bl = bench_one(
+            || unsafe { gemm_smmla_blocked(m, n, mp, np, kp, &pa, &pb, &mut c) }, ops, 1.0);
+
         println!(
-            "│ {:<16} │ {:>8.2} │ {:>8.2} │ {:>8.2} │ {:>6.1}× │ {:>6.1}× │",
+            "│ {:<16} │ {:>8.2} │ {:>8.2} │ {:>8.2} │ {:>8.2} │ {:>6.1}× │",
             format!("{}×{}×{}", m, n, k),
-            g_scalar, g_dot, g_mm, g_dot / g_scalar, g_mm / g_scalar
+            g_scalar, g_dot, g_mm, g_bl, g_bl.max(g_mm) / g_dot
         );
     }
-    println!("└──────────────────┴──────────┴──────────┴──────────┴─────────┴─────────┘");
-    println!("\nNote 1: packing is outside the timed loop - matching inference, where");
+    println!("└──────────────────┴──────────┴──────────┴──────────┴──────────┴─────────┘");
+    println!("\nSMMLA x = best of SMMLA/+blocked over SDOT.");
+    println!("Note 1: packing is outside the timed loop - matching inference, where");
     println!("        weights are packed once and reused across many tokens.");
     println!("Note 2: scalar is a naive triple loop with cache-hostile access to B. The");
     println!("        meaningful comparison is SMMLA vs SDOT; read the scalar multiples as an upper bound.");
