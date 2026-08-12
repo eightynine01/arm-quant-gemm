@@ -487,6 +487,13 @@ is at 20; this one was published at 2 and is at 5. In both cases the sweep
 stopped at the number that was expected to matter, which is exactly where it
 needed to keep going.
 
+And one of them was still machine-specific after being corrected. 16 is *this*
+machine's performance-core count, so shipping it as a constant is the same bug
+one level up — right where it was measured, quietly wrong anywhere else.
+`spin_threshold()` reads the count on macOS and falls back to the measured
+value, which is stated as a fallback rather than treated as universal. The rule
+is "up to the performance cores"; 16 is what that happened to be here.
+
 ## What this is not
 
 - **The scalar reference is a correctness oracle, not a baseline.** It is a naive triple

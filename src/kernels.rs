@@ -314,6 +314,37 @@ pub fn choose(m: usize) -> Kernel {
 /// is.
 pub const SPIN_MAX_THREADS: usize = 16;
 
+/// Performance-core count, or the best guess available.
+///
+/// [`SPIN_MAX_THREADS`] is 16 because that is *this* machine's performance-core
+/// count, and a constant tied to one machine's topology is the same bug as
+/// hardcoding a matrix width: correct where it was measured, silently wrong
+/// everywhere else. The rule is "up to the performance cores", not "up to 16".
+///
+/// macOS exposes the count directly. Elsewhere this falls back to total
+/// parallelism, which over-estimates on hybrid parts — so the fallback is
+/// documented rather than trusted, and [`spin_threshold`] takes the smaller of
+/// the two.
+pub fn performance_cores() -> Option<usize> {
+    if cfg!(target_os = "macos") {
+        let out = std::process::Command::new("sysctl")
+            .args(["-n", "hw.perflevel0.physicalcpu"])
+            .output()
+            .ok()?;
+        return String::from_utf8_lossy(&out.stdout).trim().parse().ok();
+    }
+    None
+}
+
+/// The thread count above which spinning at the barrier stops paying.
+///
+/// Measured on this machine as exactly the performance-core count; see
+/// [`SPIN_MAX_THREADS`] for the sweep. Where the count cannot be read, the
+/// measured constant is used rather than a guess from total parallelism.
+pub fn spin_threshold() -> usize {
+    performance_cores().unwrap_or(SPIN_MAX_THREADS)
+}
+
 /// Everything the repo measured, behind one call.
 ///
 /// Two rules decide the work, and neither is guessable from the instruction
@@ -342,7 +373,7 @@ impl Engine {
         let threads = threads.max(1);
         if threads == 1 {
             Engine { spin: None, chan: None }
-        } else if threads <= SPIN_MAX_THREADS {
+        } else if threads <= spin_threshold() {
             Engine { spin: Some(SpinPool::new(threads)), chan: None }
         } else {
             Engine { spin: None, chan: Some(Pool::new(threads)) }

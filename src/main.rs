@@ -237,7 +237,7 @@ fn engine_demo() {
             Kernel::Smmla => "SMMLA",
             Kernel::Sdot => "SDOT",
         };
-        let barrier = if nt <= SPIN_MAX_THREADS { "spin" } else { "chan" };
+        let barrier = if nt <= spin_threshold() { "spin" } else { "chan" };
         println!(
             "│ {:<16} │ {:>7} │ {:<10} │ {:>8.1} │ {:>7} │",
             format!("{}×{}×{}", m, n, k), nt,
@@ -246,8 +246,9 @@ fn engine_demo() {
         );
     }
     println!("└──────────────────┴─────────┴────────────┴──────────┴─────────┘");
-    println!("SMMLA above M={}, SDOT at or below. Spin barrier up to {} threads.",
-             SMMLA_MIN_ROWS, SPIN_MAX_THREADS);
+    println!("SMMLA at M>={}, SDOT below. Spin barrier up to {} threads ({} cores).",
+             SMMLA_MIN_ROWS, spin_threshold(),
+             if performance_cores().is_some() { "detected" } else { "measured default" });
 }
 
 /// Why does 16 threads lose to 8?
