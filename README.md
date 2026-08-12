@@ -185,6 +185,39 @@ machines without shipping a fixture.
 Without `FEAT_I8MM` the `SMMLA` path will fault — check
 `sysctl hw.optional.arm.FEAT_I8MM` on macOS, or `/proc/cpuinfo` for `i8mm` on Linux.
 
+## How much of the machine is this actually using?
+
+An absolute GOPS number says nothing about whether it is good. `src/roofline.rs`
+measures the instruction-issue ceiling directly: back-to-back `SMMLA`s over
+register-resident operands with 16 independent accumulators, no memory traffic.
+
+| | issue ceiling | kernel (8×4096×4096, 1 thread) | of ceiling |
+|---|---:|---:|---:|
+| SMMLA | 3469.7 GOPS | 372.6 | **10.7%** |
+| SDOT | 1664.8 GOPS | 256.2 | **15.4%** |
+
+**Both kernels sit around 10–15% of what the core can issue**, so they are bound
+by memory traffic, not arithmetic — consistent with the load-count analysis that
+motivated the 8×8 tile. The remaining ~7× is what cache blocking and deeper
+register tiling would be competing for.
+
+Note also that the ceiling ratio (3469.7 / 1664.8 = 2.08×) matches the
+instructions' MAC ratio almost exactly, which is a sanity check on the harness:
+`SMMLA` does 32 MACs to `SDOT`'s 16.
+
+**Two ways this benchmark was wrong before it was right**, both worth naming
+because they produce confident nonsense rather than errors:
+
+1. With compile-time-constant operands the whole loop folded away and the timer
+   reported `inf`.
+2. Wrapping the *accumulators* in `black_box` to stop that instead forced a
+   dependency chain through memory, and the "ceiling" came out **slower than the
+   real kernel** — 173% of peak. A ceiling below the thing it bounds is the
+   tell.
+
+The fix is `black_box` on the operands once per iteration, leaving the sixteen
+accumulator chains independent.
+
 ## What this is not
 
 - **The scalar reference is a correctness oracle, not a baseline.** It is a naive triple

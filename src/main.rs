@@ -3,6 +3,7 @@
 //! a speedup over a wrong answer is not a speedup.
 
 mod kernels;
+mod roofline;
 use kernels::*;
 use std::time::Instant;
 
@@ -188,6 +189,23 @@ fn main() {
     println!("        meaningful comparison is SMMLA vs SDOT; read the scalar multiples as an upper bound.");
 
     dispatch_demo();
+    roofline_demo();
+}
+
+/// What fraction of the machine are we actually using?
+fn roofline_demo() {
+    let (mm_ceiling, _) = unsafe { roofline::smmla_issue_ceiling(2_000_000) };
+    let (dot_ceiling, _) = unsafe { roofline::sdot_issue_ceiling(2_000_000) };
+    println!("\nSingle-core issue ceiling (register-resident, no memory traffic)");
+    println!("┌──────────┬──────────────┬──────────────┬──────────┐");
+    println!("│          │ ceiling GOPS │  kernel GOPS │ of peak  │");
+    println!("├──────────┼──────────────┼──────────────┼──────────┤");
+    println!("│ SMMLA    │ {:>12.1} │ {:>12.1} │ {:>7.1}% │",
+             mm_ceiling, 372.6, 372.6 / mm_ceiling * 100.0);
+    println!("│ SDOT     │ {:>12.1} │ {:>12.1} │ {:>7.1}% │",
+             dot_ceiling, 256.2, 256.2 / dot_ceiling * 100.0);
+    println!("└──────────┴──────────────┴──────────────┴──────────┘");
+    println!("Kernel figures are the 8x4096x4096 single-thread rows above.");
 }
 
 /// Show that dispatching on M wins in both regimes.
