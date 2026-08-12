@@ -269,6 +269,76 @@ pub fn choose(m: usize) -> Kernel {
     if m >= SMMLA_MIN_ROWS { Kernel::Smmla } else { Kernel::Sdot }
 }
 
+/// Above this thread count, spinning at the barrier costs more than it saves.
+///
+/// Measured at 8x4096x4096: spin beats channels 1.38x at 8 threads and 1.81x at
+/// 12, then **loses 0.76x at 16**. Idle spinners are not free — once the machine
+/// is saturated they take cores away from the work.
+pub const SPIN_MAX_THREADS: usize = 12;
+
+/// Everything the repo measured, behind one call.
+///
+/// Two rules decide the work, and neither is guessable from the instruction
+/// descriptions:
+///
+/// - **Which instruction**, by `m`. `SMMLA` does twice the MACs per instruction
+///   and issues at half the rate, so peak throughput is a wash (424 vs 433
+///   GOPS). Its real advantage is needing half as many instructions and loads —
+///   which evaporates at `m = 1`, where half of every 2x2 tile is padding.
+///   Crossover is exactly `m = 2`.
+/// - **Which barrier**, by thread count. Spinning wins up to
+///   [`SPIN_MAX_THREADS`] and loses past it.
+///
+/// The pools are owned by the engine rather than built per call, which is the
+/// whole point: per-call thread creation was 43–62% of the wall clock at these
+/// sizes. An `Engine` constructed inside the hot path would reintroduce exactly
+/// the cost this repo spent its measurements removing.
+pub struct Engine {
+    spin: Option<SpinPool>,
+    chan: Option<Pool>,
+}
+
+impl Engine {
+    /// Build the pools once. Not free — do this outside the hot path.
+    pub fn new(threads: usize) -> Self {
+        let threads = threads.max(1);
+        if threads == 1 {
+            Engine { spin: None, chan: None }
+        } else if threads <= SPIN_MAX_THREADS {
+            Engine { spin: Some(SpinPool::new(threads)), chan: None }
+        } else {
+            Engine { spin: None, chan: Some(Pool::new(threads)) }
+        }
+    }
+
+    /// # Safety
+    /// Requires FEAT_I8MM and FEAT_DotProd. `pa`/`pb` must be the `SMMLA`
+    /// packings and `bt` the `SDOT` packing; whichever [`choose`] selects for
+    /// this `m` is the one that gets read.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm(
+        &self,
+        m: usize, n: usize, k: usize,
+        mp: usize, np: usize, kp: usize,
+        a: &[i8], bt: &[i8],
+        pa: &[i8], pb: &[i8],
+        c: &mut [i32],
+    ) {
+        match choose(m) {
+            Kernel::Smmla => match (&self.spin, &self.chan) {
+                (Some(p), _) => gemm_smmla_spin(m, n, mp, np, kp, pa, pb, c, p),
+                (None, Some(p)) => gemm_smmla_pool(m, n, mp, np, kp, pa, pb, c, p),
+                _ => gemm_smmla_8x8(m, n, mp, np, kp, pa, pb, c),
+            },
+            Kernel::Sdot => match (&self.spin, &self.chan) {
+                (Some(p), _) => gemm_sdot_spin(m, n, k, k, a, bt, c, p),
+                (None, Some(p)) => gemm_sdot_pool(m, n, k, k, a, bt, c, p),
+                _ => gemm_sdot_tiled(m, n, k, k, a, bt, c),
+            },
+        }
+    }
+}
+
 /// Blocked `SMMLA`: same arithmetic, different loop order.
 ///
 /// [`gemm_smmla`] walks every column pair for one row pair before moving on, so
@@ -742,6 +812,42 @@ pub unsafe fn gemm_smmla_spin(
         unsafe {
             let cslice = std::slice::from_raw_parts_mut(cptr.0, clen);
             smmla_8x8_colrange(m, n, mp, kp, pa, pb, cslice, cp0, cp1);
+        }
+    });
+}
+
+/// `SDOT` over the spin pool.
+///
+/// Exists so an [`Engine`] never has to keep two pool types alive at once.
+/// Idle spinners take cores from whatever else is running — measured: a channel
+/// pool timed next to a live spin pool reads ~25% slow — so an engine holds
+/// exactly one pool and both instruction paths have to be able to use it.
+///
+/// # Safety
+/// Requires FEAT_DotProd. Same packing contract as [`gemm_sdot`].
+pub unsafe fn gemm_sdot_spin(
+    m: usize, n: usize, k: usize, kp: usize,
+    a: &[i8], bt: &[i8], c: &mut [i32], pool: &SpinPool,
+) {
+    let nthreads = pool.threads().min(n.max(1));
+    if nthreads <= 1 {
+        gemm_sdot_tiled(m, n, k, kp, a, bt, c);
+        return;
+    }
+    let chunk = n.div_ceil(nthreads);
+    let cptr = CPtr(c.as_mut_ptr());
+    let clen = c.len();
+
+    pool.run(|t| {
+        let c0 = t * chunk;
+        if c0 >= n {
+            return;
+        }
+        let c1 = ((t + 1) * chunk).min(n);
+        let cptr = cptr;
+        unsafe {
+            let cslice = std::slice::from_raw_parts_mut(cptr.0, clen);
+            sdot_colrange(m, n, k, kp, a, bt, cslice, c0, c1);
         }
     });
 }

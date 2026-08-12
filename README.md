@@ -404,6 +404,35 @@ Decode throughput improved too — pooled `SDOT` at M=1 peaks at 364 GOPS agains
 
 Cleaning a harness usually costs you a result. This one paid.
 
+## Using it: one call that applies both rules
+
+Two measured rules decide the work here, and neither follows from reading the
+instruction descriptions. `Engine` holds them so a caller does not have to.
+
+```rust
+let eng = Engine::new(12);            // build the pool once, outside the hot path
+unsafe { eng.gemm(m, n, k, mp, np, kp, &a, &bt, &pa, &pb, &mut c) };
+```
+
+| M×N×K | threads | picked | GOPS | vs scalar |
+|---|---:|---|---:|---|
+| 1×1024×1024 | 8 | SDOT / spin | 449.2 | match |
+| 8×1024×1024 | 8 | SMMLA / spin | 2191.6 | match |
+| 8×4096×4096 | 12 | SMMLA / spin | **4016.6** | match |
+| 8×4096×4096 | 16 | SMMLA / chan | 2215.3 | match |
+| 64×1024×1024 | 12 | SMMLA / spin | 3601.4 | match |
+
+Every row is checked against the scalar reference, not against the fast path —
+an API that encodes rules is only worth shipping if it still computes the right
+thing.
+
+Note what `Engine::new` does **not** do: it does not build a pool per call. That
+would put back the 43–62% this repo spent its measurements removing, which is
+why the pool is owned by the engine and the constructor is documented as the
+expensive part. It also holds exactly *one* pool type rather than both, because
+idle spinners take cores from whatever else is running — measured at ~25% when
+a channel pool was timed next to a live spin pool.
+
 ## What this is not
 
 - **The scalar reference is a correctness oracle, not a baseline.** It is a naive triple

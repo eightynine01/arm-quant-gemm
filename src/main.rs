@@ -192,6 +192,61 @@ fn main() {
     roofline_demo();
     unroll_demo();
     thread_balance_demo();
+    engine_demo();
+}
+
+/// The one-call path, and a check that it actually picks what it claims.
+///
+/// An API that encodes measured rules is only worth shipping if it produces the
+/// same answer as the kernels it dispatches to, so every shape here is compared
+/// against the scalar reference rather than against the fast path.
+fn engine_demo() {
+    println!("\nEngine: one call, both rules applied");
+    println!("┌──────────────────┬─────────┬────────────┬──────────┬─────────┐");
+    println!("│ M×N×K            │ threads │  picked    │   GOPS   │ correct │");
+    println!("├──────────────────┼─────────┼────────────┼──────────┼─────────┤");
+
+    for &(m, n, k, nt) in &[
+        (1usize, 1024usize, 1024usize, 8usize),
+        (8, 1024, 1024, 8),
+        (8, 4096, 4096, 12),
+        (8, 4096, 4096, 16),
+        (64, 1024, 1024, 12),
+    ] {
+        let ops = 2.0 * m as f64 * n as f64 * k as f64;
+        let (mut a, mut b) = (vec![0i8; m * k], vec![0i8; k * n]);
+        fill(&mut a, 0x9E3779B97F4A7C15);
+        fill(&mut b, 0xBF58476D1CE4E5B9);
+        let mut c_ref = vec![0i32; m * n];
+        gemm_scalar(m, n, k, &a, &b, &mut c_ref);
+
+        let bt = pack_b_transposed(n, k, k, &b);
+        let (pa, mp, kp) = pack_a_smmla(m, k, &a);
+        let (pb, np) = pack_b_smmla(n, k, &b);
+        let mut c = vec![0i32; m * n];
+
+        let eng = Engine::new(nt);
+        unsafe { eng.gemm(m, n, k, mp, np, kp, &a, &bt, &pa, &pb, &mut c) };
+        let ok = c == c_ref;
+
+        let g = bench_one(
+            || unsafe { eng.gemm(m, n, k, mp, np, kp, &a, &bt, &pa, &pb, &mut c) },
+            ops, 0.5);
+        let picked = match choose(m) {
+            Kernel::Smmla => "SMMLA",
+            Kernel::Sdot => "SDOT",
+        };
+        let barrier = if nt <= SPIN_MAX_THREADS { "spin" } else { "chan" };
+        println!(
+            "│ {:<16} │ {:>7} │ {:<10} │ {:>8.1} │ {:>7} │",
+            format!("{}×{}×{}", m, n, k), nt,
+            format!("{}/{}", picked, barrier), g,
+            if ok { "match" } else { "MISMATCH" }
+        );
+    }
+    println!("└──────────────────┴─────────┴────────────┴──────────┴─────────┘");
+    println!("SMMLA above M={}, SDOT at or below. Spin barrier up to {} threads.",
+             SMMLA_MIN_ROWS, SPIN_MAX_THREADS);
 }
 
 /// Why does 16 threads lose to 8?
