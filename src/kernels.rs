@@ -381,6 +381,113 @@ pub unsafe fn smmla_8x8_colrange(
     }
 }
 
+/// Same tile, same traffic, `k` unrolled by two.
+///
+/// The roofline says this kernel is memory-bound but only reaches 26% of its
+/// memory ceiling, and that B is already read the minimum number of times — so
+/// the gap is not traffic volume but how much of it is in flight at once. The
+/// `kb` loop issues eight independent loads and then consumes them; doubling
+/// the step puts sixteen in flight against the same bytes.
+///
+/// Kept as a separate function rather than replacing the original so the two
+/// can be measured against each other. `unroll_demo()` reports the result.
+///
+/// # Safety
+/// Requires FEAT_I8MM. Same packing contract as [`gemm_smmla`].
+#[target_feature(enable = "i8mm")]
+pub unsafe fn smmla_8x8_colrange_u2(
+    m: usize, n: usize, mp: usize, kp: usize,
+    pa: &[i8], pb: &[i8], c: &mut [i32], cp0_lo: usize, cp1_hi: usize,
+) {
+    let kblocks = kp / 8;
+    let rowpairs = mp / 2;
+    let colpairs = cp1_hi;
+
+    let mut rp0 = 0;
+    while rp0 < rowpairs {
+        let mut cp0 = cp0_lo;
+        while cp0 < cp1_hi {
+            let mut acc = [[vdupq_n_s32(0); 4]; 4];
+
+            let mut ap = [std::ptr::null::<i8>(); 4];
+            let mut bp = [std::ptr::null::<i8>(); 4];
+            for i in 0..4 {
+                ap[i] = pa.as_ptr().add((rp0 + i).min(rowpairs - 1) * kblocks * 16);
+                bp[i] = pb.as_ptr().add((cp0 + i).min(colpairs - 1) * kblocks * 16);
+            }
+
+            let pairs = kblocks / 2;
+            for kk in 0..pairs {
+                let o0 = kk * 32;
+                let o1 = o0 + 16;
+                // Both halves' loads are issued before either is consumed, so
+                // sixteen loads are outstanding instead of eight.
+                let av0 = [
+                    vld1q_s8(ap[0].add(o0)), vld1q_s8(ap[1].add(o0)),
+                    vld1q_s8(ap[2].add(o0)), vld1q_s8(ap[3].add(o0)),
+                ];
+                let bv0 = [
+                    vld1q_s8(bp[0].add(o0)), vld1q_s8(bp[1].add(o0)),
+                    vld1q_s8(bp[2].add(o0)), vld1q_s8(bp[3].add(o0)),
+                ];
+                let av1 = [
+                    vld1q_s8(ap[0].add(o1)), vld1q_s8(ap[1].add(o1)),
+                    vld1q_s8(ap[2].add(o1)), vld1q_s8(ap[3].add(o1)),
+                ];
+                let bv1 = [
+                    vld1q_s8(bp[0].add(o1)), vld1q_s8(bp[1].add(o1)),
+                    vld1q_s8(bp[2].add(o1)), vld1q_s8(bp[3].add(o1)),
+                ];
+                for i in 0..4 {
+                    for j in 0..4 {
+                        acc[i][j] = vmmlaq_s32(acc[i][j], av0[i], bv0[j]);
+                        acc[i][j] = vmmlaq_s32(acc[i][j], av1[i], bv1[j]);
+                    }
+                }
+            }
+            // Odd tail: kblocks is not required to be even.
+            if kblocks % 2 == 1 {
+                let off = (kblocks - 1) * 16;
+                let av = [
+                    vld1q_s8(ap[0].add(off)), vld1q_s8(ap[1].add(off)),
+                    vld1q_s8(ap[2].add(off)), vld1q_s8(ap[3].add(off)),
+                ];
+                let bv = [
+                    vld1q_s8(bp[0].add(off)), vld1q_s8(bp[1].add(off)),
+                    vld1q_s8(bp[2].add(off)), vld1q_s8(bp[3].add(off)),
+                ];
+                for i in 0..4 {
+                    for j in 0..4 {
+                        acc[i][j] = vmmlaq_s32(acc[i][j], av[i], bv[j]);
+                    }
+                }
+            }
+
+            for i in 0..4 {
+                for j in 0..4 {
+                    if rp0 + i < rowpairs && cp0 + j < colpairs {
+                        store_tile(acc[i][j], (rp0 + i) * 2, (cp0 + j) * 2, m, n, c);
+                    }
+                }
+            }
+            cp0 += 4;
+        }
+        rp0 += 4;
+    }
+}
+
+/// `k`-unrolled 8×8 over the full column range.
+///
+/// # Safety
+/// Requires FEAT_I8MM. Same packing contract as [`gemm_smmla`].
+#[target_feature(enable = "i8mm")]
+pub unsafe fn gemm_smmla_8x8_u2(
+    m: usize, n: usize, mp: usize, np: usize, kp: usize,
+    pa: &[i8], pb: &[i8], c: &mut [i32],
+) {
+    smmla_8x8_colrange_u2(m, n, mp, kp, pa, pb, c, 0, np / 2);
+}
+
 /// Raw `*mut i32` that threads may hold concurrently.
 ///
 /// Sound only because every thread writes a disjoint set of C elements — the

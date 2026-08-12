@@ -36,41 +36,84 @@ use std::time::Instant;
 
 /// # Safety
 /// Requires FEAT_I8MM.
+/// Written in inline assembly, after four attempts in intrinsics all failed.
+///
+/// The failures are worth naming because each produced a plausible number
+/// rather than an error:
+///
+/// | attempt | result | what actually happened |
+/// |---|---|---|
+/// | constant operands | `inf` | loop folded away entirely |
+/// | `black_box` on accumulators | 173% of peak | dependency forced through memory; measured latency |
+/// | 16 identical chains | 15.7 SMMLA/cycle | all chains computed the same value, CSE'd into one |
+/// | `black_box` on operand arrays | 74 GOPS vs a 380 GOPS kernel | an 8-vector array does not fit in registers, so the barrier spilled it to stack every iteration |
+///
+/// The last one is the reason for dropping to assembly. `black_box` is the only
+/// portable barrier available, and applying it to anything larger than a single
+/// register forces a round trip through the stack — which is precisely the
+/// traffic a register-resident benchmark must not have. There is no placement
+/// of it that both keeps eight chains independent and keeps them in registers.
+///
+/// In assembly the question does not arise: eight independent `SMMLA`s on
+/// distinct destination registers, a `subs`/`b.ne` loop, and nothing the
+/// optimiser is permitted to touch.
+///
+/// # Safety
+/// Requires FEAT_I8MM.
 #[target_feature(enable = "i8mm")]
 pub unsafe fn smmla_issue_ceiling(iters: u64) -> (f64, i32) {
-    // black_box on the operands: with compile-time constants the whole loop
-    // folds away and the timer reports `inf`. Asking for a number that cannot
-    // be produced is worse than asking for nothing.
-    let a = black_box(vdupq_n_s8(1));
-    let b = black_box(vdupq_n_s8(1));
-    // 16 accumulators: enough independent chains that latency cannot bind, and
-    // still inside the 32 NEON registers with room for the operands.
-    let mut acc = [vdupq_n_s32(0); 16];
-
+    let mut n = iters;
     let t0 = Instant::now();
-    for _ in 0..iters {
-        // black_box on the operands only, once per iteration. Putting it on the
-        // accumulators instead forces a dependency through memory and measures
-        // a latency-bound *floor* — the first attempt did exactly that and
-        // reported a "ceiling" slower than the real kernel.
-        let a = black_box(a);
-        let b = black_box(b);
-        for slot in acc.iter_mut() {
-            *slot = vmmlaq_s32(*slot, a, b);
-        }
-    }
+    core::arch::asm!(
+        // 16 accumulators (v0-v15) and 8 operands (v16-v23), initialised
+        // in-place so nothing has to be handed in and no load appears in the
+        // loop body.
+        "movi v0.4s, #0", "movi v1.4s, #0", "movi v2.4s, #0", "movi v3.4s, #0",
+        "movi v4.4s, #0", "movi v5.4s, #0", "movi v6.4s, #0", "movi v7.4s, #0",
+        "movi v8.4s, #0", "movi v9.4s, #0", "movi v10.4s, #0", "movi v11.4s, #0",
+        "movi v12.4s, #0", "movi v13.4s, #0", "movi v14.4s, #0", "movi v15.4s, #0",
+        "movi v16.16b, #1", "movi v17.16b, #2", "movi v18.16b, #3",
+        "movi v19.16b, #4", "movi v20.16b, #5", "movi v21.16b, #6",
+        "movi v22.16b, #7", "movi v23.16b, #8",
+        "2:",
+        // 32 SMMLAs per iteration against 2 loop-control instructions. The
+        // 8-per-iteration version spent ~20% of its slots on `subs`/`b.ne` and
+        // came out at 262 GOPS, below the 363 GOPS kernel it was supposed to
+        // bound. Each accumulator is written twice, spaced 16 instructions
+        // apart, so the second write is far past the first one's latency.
+        "smmla v0.4s, v16.16b, v17.16b", "smmla v1.4s, v18.16b, v19.16b",
+        "smmla v2.4s, v20.16b, v21.16b", "smmla v3.4s, v22.16b, v23.16b",
+        "smmla v4.4s, v16.16b, v19.16b", "smmla v5.4s, v18.16b, v21.16b",
+        "smmla v6.4s, v20.16b, v23.16b", "smmla v7.4s, v22.16b, v17.16b",
+        "smmla v8.4s, v16.16b, v21.16b", "smmla v9.4s, v18.16b, v23.16b",
+        "smmla v10.4s, v20.16b, v17.16b", "smmla v11.4s, v22.16b, v19.16b",
+        "smmla v12.4s, v16.16b, v23.16b", "smmla v13.4s, v18.16b, v17.16b",
+        "smmla v14.4s, v20.16b, v19.16b", "smmla v15.4s, v22.16b, v21.16b",
+        "smmla v0.4s, v17.16b, v16.16b", "smmla v1.4s, v19.16b, v18.16b",
+        "smmla v2.4s, v21.16b, v20.16b", "smmla v3.4s, v23.16b, v22.16b",
+        "smmla v4.4s, v19.16b, v16.16b", "smmla v5.4s, v21.16b, v18.16b",
+        "smmla v6.4s, v23.16b, v20.16b", "smmla v7.4s, v17.16b, v22.16b",
+        "smmla v8.4s, v21.16b, v16.16b", "smmla v9.4s, v23.16b, v18.16b",
+        "smmla v10.4s, v17.16b, v20.16b", "smmla v11.4s, v19.16b, v22.16b",
+        "smmla v12.4s, v23.16b, v16.16b", "smmla v13.4s, v17.16b, v18.16b",
+        "smmla v14.4s, v19.16b, v20.16b", "smmla v15.4s, v21.16b, v22.16b",
+        "subs {n}, {n}, #1",
+        "b.ne 2b",
+        n = inout(reg) n,
+        out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+        out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+        out("v8") _, out("v9") _, out("v10") _, out("v11") _,
+        out("v12") _, out("v13") _, out("v14") _, out("v15") _,
+        out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+        out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+        options(nostack)
+    );
     let secs = t0.elapsed().as_secs_f64();
 
     // Each SMMLA produces a 2x2 int32 tile from 8-deep operands: 32 MACs,
     // counted as 64 ops to match the 2*M*N*K convention used elsewhere.
-    let ops = iters as f64 * 16.0 * 64.0;
-
-    // Consume the accumulators so the loop cannot be optimised away.
-    let mut sink = 0i32;
-    for slot in acc.iter() {
-        sink = sink.wrapping_add(vgetq_lane_s32(*slot, 0));
-    }
-    (ops / secs / 1e9, sink)
+    let ops = iters as f64 * 32.0 * 64.0;
+    (ops / secs / 1e9, 0)
 }
 
 /// Sustained single-core load bandwidth for a buffer of `bytes`, in GB/s.
@@ -149,26 +192,47 @@ pub fn stream_bandwidth(bytes: usize, iters: u64) -> (f64, i32) {
 /// Requires FEAT_DotProd.
 #[target_feature(enable = "dotprod")]
 pub unsafe fn sdot_issue_ceiling(iters: u64) -> (f64, i32) {
-    let a = black_box(vdupq_n_s8(1));
-    let b = black_box(vdupq_n_s8(1));
-    let mut acc = [vdupq_n_s32(0); 16];
-
+    let mut n = iters;
     let t0 = Instant::now();
-    for _ in 0..iters {
-        let a = black_box(a);
-        let b = black_box(b);
-        for slot in acc.iter_mut() {
-            *slot = vdotq_s32(*slot, a, b);
-        }
-    }
+    core::arch::asm!(
+        "movi v0.4s, #0", "movi v1.4s, #0", "movi v2.4s, #0", "movi v3.4s, #0",
+        "movi v4.4s, #0", "movi v5.4s, #0", "movi v6.4s, #0", "movi v7.4s, #0",
+        "movi v8.4s, #0", "movi v9.4s, #0", "movi v10.4s, #0", "movi v11.4s, #0",
+        "movi v12.4s, #0", "movi v13.4s, #0", "movi v14.4s, #0", "movi v15.4s, #0",
+        "movi v16.16b, #1", "movi v17.16b, #2", "movi v18.16b, #3",
+        "movi v19.16b, #4", "movi v20.16b, #5", "movi v21.16b, #6",
+        "movi v22.16b, #7", "movi v23.16b, #8",
+        "2:",
+        "sdot v0.4s, v16.16b, v17.16b", "sdot v1.4s, v18.16b, v19.16b",
+        "sdot v2.4s, v20.16b, v21.16b", "sdot v3.4s, v22.16b, v23.16b",
+        "sdot v4.4s, v16.16b, v19.16b", "sdot v5.4s, v18.16b, v21.16b",
+        "sdot v6.4s, v20.16b, v23.16b", "sdot v7.4s, v22.16b, v17.16b",
+        "sdot v8.4s, v16.16b, v21.16b", "sdot v9.4s, v18.16b, v23.16b",
+        "sdot v10.4s, v20.16b, v17.16b", "sdot v11.4s, v22.16b, v19.16b",
+        "sdot v12.4s, v16.16b, v23.16b", "sdot v13.4s, v18.16b, v17.16b",
+        "sdot v14.4s, v20.16b, v19.16b", "sdot v15.4s, v22.16b, v21.16b",
+        "sdot v0.4s, v17.16b, v16.16b", "sdot v1.4s, v19.16b, v18.16b",
+        "sdot v2.4s, v21.16b, v20.16b", "sdot v3.4s, v23.16b, v22.16b",
+        "sdot v4.4s, v19.16b, v16.16b", "sdot v5.4s, v21.16b, v18.16b",
+        "sdot v6.4s, v23.16b, v20.16b", "sdot v7.4s, v17.16b, v22.16b",
+        "sdot v8.4s, v21.16b, v16.16b", "sdot v9.4s, v23.16b, v18.16b",
+        "sdot v10.4s, v17.16b, v20.16b", "sdot v11.4s, v19.16b, v22.16b",
+        "sdot v12.4s, v23.16b, v16.16b", "sdot v13.4s, v17.16b, v18.16b",
+        "sdot v14.4s, v19.16b, v20.16b", "sdot v15.4s, v21.16b, v22.16b",
+        "subs {n}, {n}, #1",
+        "b.ne 2b",
+        n = inout(reg) n,
+        out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+        out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+        out("v8") _, out("v9") _, out("v10") _, out("v11") _,
+        out("v12") _, out("v13") _, out("v14") _, out("v15") _,
+        out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+        out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+        options(nostack)
+    );
     let secs = t0.elapsed().as_secs_f64();
 
     // SDOT: 4 lanes x 4 products = 16 MACs = 32 ops.
-    let ops = iters as f64 * 16.0 * 32.0;
-
-    let mut sink = 0i32;
-    for slot in acc.iter() {
-        sink = sink.wrapping_add(vgetq_lane_s32(*slot, 0));
-    }
-    (ops / secs / 1e9, sink)
+    let ops = iters as f64 * 32.0 * 32.0;
+    (ops / secs / 1e9, 0)
 }

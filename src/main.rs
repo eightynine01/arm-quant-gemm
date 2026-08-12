@@ -190,6 +190,54 @@ fn main() {
 
     dispatch_demo();
     roofline_demo();
+    unroll_demo();
+}
+
+/// Does putting more loads in flight close any of the gap to the memory ceiling?
+///
+/// The roofline localised the headroom to memory-level parallelism: traffic is
+/// already minimal and issue slots are not the limit. This is the direct test —
+/// same tile, same bytes, `k` unrolled by two so sixteen loads are outstanding
+/// instead of eight.
+fn unroll_demo() {
+    println!("\nk-unroll by 2 (same tile, same traffic, 2x loads in flight)");
+    println!("┌──────────────────┬──────────┬──────────┬──────────┬─────────┐");
+    println!("│ M×N×K            │  8×8     │  8×8 u2  │   gain   │ correct │");
+    println!("├──────────────────┼──────────┼──────────┼──────────┼─────────┤");
+
+    for &(m, n, k) in &[
+        (8usize, 4096usize, 4096usize),
+        (64, 1024, 1024),
+        (1024, 1024, 1024),
+    ] {
+        let ops = 2.0 * m as f64 * n as f64 * k as f64;
+        let (mut a, mut b) = (vec![0i8; m * k], vec![0i8; k * n]);
+        fill(&mut a, 0x9E3779B97F4A7C15);
+        fill(&mut b, 0xBF58476D1CE4E5B9);
+        let (pa, mp, kp) = pack_a_smmla(m, k, &a);
+        let (pb, np) = pack_b_smmla(n, k, &b);
+
+        // Correctness before speed: a faster kernel that computes the wrong
+        // thing is not a result. Compared against the existing 8x8, which the
+        // scalar reference already validates above.
+        let mut c0 = vec![0i32; m * n];
+        let mut c1 = vec![0i32; m * n];
+        unsafe { gemm_smmla_8x8(m, n, mp, np, kp, &pa, &pb, &mut c0) };
+        unsafe { gemm_smmla_8x8_u2(m, n, mp, np, kp, &pa, &pb, &mut c1) };
+        let ok = c0 == c1;
+
+        let g0 = bench_one(
+            || unsafe { gemm_smmla_8x8(m, n, mp, np, kp, &pa, &pb, &mut c0) }, ops, 0.8);
+        let g1 = bench_one(
+            || unsafe { gemm_smmla_8x8_u2(m, n, mp, np, kp, &pa, &pb, &mut c1) }, ops, 0.8);
+
+        println!(
+            "│ {:<16} │ {:>8.1} │ {:>8.1} │ {:>7.2}× │ {:>7} │",
+            format!("{}×{}×{}", m, n, k), g0, g1, g1 / g0,
+            if ok { "match" } else { "MISMATCH" }
+        );
+    }
+    println!("└──────────────────┴──────────┴──────────┴──────────┴─────────┘");
 }
 
 /// What fraction of the machine are we actually using?
@@ -197,8 +245,8 @@ fn main() {
 /// Two ceilings, not one. Reporting only the issue ceiling makes every
 /// memory-bound kernel look like it is squandering the machine.
 fn roofline_demo() {
-    let (mm_ceiling, _) = unsafe { roofline::smmla_issue_ceiling(2_000_000) };
-    let (dot_ceiling, _) = unsafe { roofline::sdot_issue_ceiling(2_000_000) };
+    let (mm_ceiling, _) = unsafe { roofline::smmla_issue_ceiling(8_000_000) };
+    let (dot_ceiling, _) = unsafe { roofline::sdot_issue_ceiling(8_000_000) };
 
     // Measured live rather than quoted from the table above: a hardcoded kernel
     // figure silently goes stale the moment the kernel changes, and a roofline
@@ -216,6 +264,35 @@ fn roofline_demo() {
     let bt = pack_b_transposed(n, k, k, &b);
     let g_dot = bench_one(
         || unsafe { gemm_sdot_tiled(m, n, k, k, &a, &bt, &mut c) }, ops, 0.8);
+
+    // Issue rates are checkable against physics in a way GOPS is not: divide by
+    // ops-per-instruction and clock, and anything above a handful per cycle is
+    // a deleted loop, not a fast core. The first version of this benchmark
+    // reported 15.7 SMMLA/cycle and nothing in the GOPS figure gave that away.
+    const CLOCK_GHZ: f64 = 3.5;
+    let per_cycle = |gops: f64, ops_per_insn: f64| gops / ops_per_insn / CLOCK_GHZ;
+    let mm_ipc = per_cycle(mm_ceiling, 64.0);
+    let dot_ipc = per_cycle(dot_ceiling, 32.0);
+    if mm_ipc > 8.0 || dot_ipc > 8.0 {
+        println!(
+            "\nIssue ceiling is not usable: {:.1} SMMLA/cycle, {:.1} SDOT/cycle at ~{} GHz.",
+            mm_ipc, dot_ipc, CLOCK_GHZ
+        );
+        println!("No core issues that many; the loop was optimised out. Skipping the roofline.");
+        return;
+    }
+    // The opposite failure, which has also happened twice: a barrier placed so
+    // that it serialises the measurement chains produces a "ceiling" the real
+    // kernel beats. A bound below the thing it bounds is self-refuting.
+    if mm_ceiling < g_mm || dot_ceiling < g_dot {
+        println!(
+            "\nIssue ceiling is not usable: {:.1} GOPS against a {:.1} GOPS kernel.",
+            mm_ceiling.min(dot_ceiling), g_mm
+        );
+        println!("A ceiling below the kernel it bounds means the measurement loop was");
+        println!("serialised, not that the kernel is superhuman. Skipping the roofline.");
+        return;
+    }
 
     println!("\nSingle-core issue ceiling (register-resident, no memory traffic)");
     println!("┌──────────┬──────────────┬──────────────┬──────────┐");
@@ -268,9 +345,12 @@ fn roofline_demo() {
         return;
     }
 
-    // intensity = 2 * mt ops/byte, derived in roofline.rs. The 8x8 kernel reads
-    // B once per 8 rows of A, so at m = 8 it reads B exactly once: this is the
-    // minimum traffic the shape allows, not a blocking failure.
+    // At m = 8 with an 8-row tile there is exactly one row block, so A is read
+    // once (32 KiB, negligible) and B is read once (16 MiB): intensity is
+    // 2*m*n*k / (n*k) = 2*mt = 16 ops/byte. The general form when both
+    // dimensions are blocked is 2*mt*nt/(mt+nt), because A is re-read per
+    // column block too -- 8 ops/byte for this tile. Either way the memory
+    // ceiling lands well above the issue ceiling, which is what binds.
     let intensity = 16.0;
     let mem_ceiling = bw_at_b * intensity;
     let binding = mem_ceiling.min(mm_ceiling);

@@ -187,76 +187,97 @@ Without `FEAT_I8MM` the `SMMLA` path will fault — check
 
 ## How much of the machine is this actually using?
 
-An absolute GOPS number says nothing about whether it is good, and the obvious
-denominator is the wrong one. `src/roofline.rs` measures both ceilings.
+An absolute GOPS number says nothing about whether it is good. `src/roofline.rs`
+measures both ceilings, and the answer changed the story twice before it settled.
 
-**Issue ceiling** — back-to-back `SMMLA`s over register-resident operands, 16
-independent accumulators, no memory traffic:
+### Peak throughput: SMMLA and SDOT are the same
 
-| | issue ceiling | kernel (8×4096×4096, 1 thread) | of ceiling |
+Back-to-back instructions on distinct registers, no memory traffic, 32 per loop
+iteration so the loop control does not distort the rate:
+
+| | peak GOPS | instructions/s | per instruction |
 |---|---:|---:|---:|
-| SMMLA | 3430.2 GOPS | 349.2 | 10.2% |
-| SDOT | 1714.2 GOPS | 252.5 | 14.7% |
+| SMMLA | 424 | 6.6 G/s | 64 ops |
+| SDOT | 433 | 13.5 G/s | 32 ops |
 
-The ratio 3430.2 / 1714.2 = 2.00× matches the instructions' MAC ratio exactly
-(`SMMLA` does 32 to `SDOT`'s 16), which is a sanity check on the harness.
+**`SMMLA` does twice the work per instruction and issues at half the rate, so
+peak throughput is a wash — 424 against 433 GOPS.** This is the finding the rest
+of the project sits on. It explains why the tiled-vs-tiled comparison lands at
+1.1–1.5× rather than the 2× the instruction description suggests: the win comes
+from needing half as many instructions and half as many loads for the same work,
+not from more arithmetic per second.
 
-**Memory ceiling** — single-core load bandwidth, swept by footprint, because
-which level of the hierarchy the B panel lives in is what sets the ceiling:
+It also explains the M=1 loss cleanly. With no throughput advantage to spend,
+the wasted half of every padded 2×2 tile has nothing to offset it.
 
-| footprint | GB/s |
+### Which ceiling binds
+
+| footprint | single-core load GB/s |
 |---:|---:|
-| 64 KiB | 148.8 |
-| 4 MiB | 92.4 |
-| 16 MiB (= B panel here) | 83.1 |
-| 256 MiB | 55.7 |
+| 64 KiB | 154.1 |
+| 4 MiB | 91.7 |
+| 16 MiB (= B panel at 8×4096×4096) | 77.5 |
+| 256 MiB | 54.7 |
 
-Arithmetic intensity has a closed form. With an `mt`-row register tile, B is
-re-read once per block of `mt` rows, so `2*m*n*k` ops ride on `(m/mt)*n*k` bytes:
+At `m = 8` with an 8-row tile there is one row block, so A is read once (32 KiB)
+and B once (16 MiB): intensity is `2·mt` = **16 ops/byte**, giving a memory
+ceiling of `77.5 × 16 = 1240 GOPS`. (When both dimensions are blocked the general
+form is `2·mt·nt/(mt+nt)` = 8 ops/byte, because A is re-read per column block.)
 
-```
-intensity = 2 * mt   ops per byte
-```
+The issue ceiling is 424 GOPS. **That is what binds, and the kernel is at 85% of
+it.** Not memory-bound — issue-bound, and close to done.
 
-The shape cancels. The 8×8 kernel is pinned at **16 ops/byte** regardless of
-`m`, `n`, `k`, so its memory ceiling is `83.1 × 16 = 1329.9 GOPS`.
+Three independent observations agree, which is the reason to believe it:
 
-**That is the ceiling that binds, and the kernel is at 26.3% of it.** Not 10.2%.
-Reporting the issue ceiling alone would have made a memory-bound kernel look
-like it was squandering the machine, and would have pointed optimisation effort
-at instruction scheduling, where there is nothing to win.
+1. Throughput is **shape-independent**: 371 GOPS at 8×4096×4096 (B streamed from
+   DRAM), 372 at 64×1024×1024, 371 at 1024×1024×1024 (B cache-resident). Measured
+   bandwidth varies 154 → 55 GB/s across those footprints. A memory-bound kernel
+   could not be flat across them.
+2. Doubling loads in flight does nothing. `smmla_8x8_colrange_u2` unrolls `k` by
+   two — same tile, same bytes, sixteen loads outstanding instead of eight — and
+   measures **0.93–1.00×**. Bit-identical output. If memory were the limit this
+   would have moved.
+3. 85% of the issue ceiling is where a well-scheduled kernel should sit.
 
-It also rules out the first thing you would reach for. At `m = 8` with an 8-row
-tile B is read **exactly once** — that is the floor, so no amount of cache
-blocking can reduce the traffic. The 3.8× that is left is not in traffic volume
-and not in issue slots; it is in memory-level parallelism, i.e. keeping more
-loads in flight. That is a much narrower place to look than "it's memory-bound".
+**An earlier version of this section claimed the opposite** — that the kernel was
+memory-bound at 26% of a memory ceiling — because the issue ceiling was being
+measured wrong and came out far too high. That claim was published and is
+retracted here. The k-unroll experiment was designed to exploit it and failed,
+which is what sent me back to check the denominator.
 
-**Three ways this benchmark was wrong before it was right.** All three produced
-confident numbers rather than errors, which is why they are recorded here:
+### Four ways the ceiling measurement was wrong
 
-1. Compile-time-constant operands let the issue loop fold away entirely and the
-   timer reported `inf`.
-2. Wrapping the *accumulators* in `black_box` to stop that instead forced a
-   dependency chain through memory, and the "ceiling" came out **slower than the
-   real kernel** — 173% of peak. A ceiling below the thing it bounds is the tell.
-3. The bandwidth loop was eliminated twice. First a constant-filled buffer let
-   LLVM prove every load returned the same byte (487,803,629 GB/s, and `inf` at
-   one size). Then, with an LCG fill and an opaque base pointer, every pass still
-   added the same bytes to the same accumulators, so the outer loop was
-   strength-reduced to one pass times a constant.
+None of these produced an error. Each produced a plausible number.
 
-The third one is the instructive one, because the *size* of the number was not
-what exposed it — 229,446 GB/s and 487,803,629 GB/s are both just "too big" and
-neither says where the bug is. The **slope** did: bandwidth came out rising with
-footprint, and bandwidth that improves as the working set leaves cache is
-impossible. Reading the shape rather than the magnitude is what located it.
+| attempt | reported | what actually happened |
+|---|---|---|
+| constant operands | `inf` | loop folded away entirely |
+| `black_box` on accumulators | 173% of peak | dependency forced through memory; measured latency, not issue rate |
+| 16 chains, identical operands | 3524 GOPS | every chain computed the same value, CSE'd into one |
+| `black_box` on operand arrays | 74 GOPS | an 8-vector array does not fit in registers, so the barrier spilled it to stack every iteration |
 
-The fixes are `black_box` on the operands once per iteration for the issue loops,
-and on the accumulators once per *pass* for the bandwidth loop — per pass, not
-per load, so the barrier is amortised over thousands of loads instead of
-serialising them. `roofline_demo()` now also refuses to print a memory ceiling
-built on an implausible bandwidth, since this class of bug got through twice.
+The fourth is why this is written in inline assembly. `black_box` is the only
+portable barrier available, and applied to anything wider than one register it
+forces a round trip through the stack — exactly the traffic a register-resident
+benchmark must not have. There is no placement of it that keeps the chains both
+independent and in registers.
+
+Two of these were caught by arithmetic rather than by inspection, and the checks
+are now in the code:
+
+- **Per-cycle plausibility.** 3524 GOPS is unreadable, but 3524 / 64 ops / 3.5 GHz
+  = **15.7 SMMLA per cycle** is obviously impossible. `roofline_demo()` refuses to
+  print a roofline above 8 per cycle.
+- **A ceiling below its kernel.** 173% of peak, and later 74 GOPS against a
+  380 GOPS kernel. A bound the measured thing exceeds is self-refuting, and that
+  is also checked.
+
+The bandwidth loop had its own version of this, twice: a constant-filled buffer
+let LLVM prove every load returned the same byte (487,803,629 GB/s), and after an
+LCG fill it was still strength-reduced because every pass added the same bytes to
+the same accumulators. What located that one was not magnitude but **slope** —
+bandwidth came out rising with footprint, and bandwidth that improves as the
+working set leaves cache is impossible.
 
 ## What this is not
 
