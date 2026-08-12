@@ -254,9 +254,30 @@ pub unsafe fn gemm_smmla(
 /// worse (8×8 spans four row pairs, three of them padding at M=1) while making
 /// load amortisation better, and the two roughly cancel.
 ///
-/// Kept because it costs one integer compare and is never negative. Not kept
-/// because it is important — fixing the register tile mattered ~10× more.
-pub const SMMLA_MIN_ROWS: usize = 2;
+/// Dispatch to `SMMLA` at or above this many rows.
+///
+/// **This was 2, from the instruction's geometry, and it was wrong.** `SMMLA`
+/// emits two rows, so M>=2 avoids padding *the instruction* — but the kernel
+/// tiles 8 rows, and that is what decides. Measured at N=K=4096, single thread,
+/// SMMLA ÷ SDOT over two runs:
+///
+/// ```text
+///     M      1     2     3     4     5     6     7     8    12    16
+///     run1  0.70  0.72  0.73  0.78  1.54  1.45  1.44  1.47  1.17  1.40
+///     run2  0.73  0.71  0.73  0.76  1.47  1.45  1.49  1.48  1.11  1.50
+/// ```
+///
+/// The crossover is at **M=5**, sharp and reproducible. At M=2..4 the old rule
+/// picked `SMMLA` and lost about 25% for it.
+///
+/// The reason is visible in the SDOT column, which peaks at M=4 (232-246 GOPS)
+/// and collapses at M=5 (149-157). `SDOT` tiles 4 rows: M=4 fills it exactly,
+/// M=5 starts a second row-block that is mostly padding. `SMMLA` climbs
+/// steadily as its 8-row tile fills. **So the boundary is tile against tile,
+/// not instruction against instruction** — which is the same conclusion as the
+/// rest of this repo, arrived at from the other direction. M=12 dipping to
+/// 1.1x is the same effect once more: 12 = 8 + 4, half a tile.
+pub const SMMLA_MIN_ROWS: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kernel {

@@ -450,6 +450,35 @@ expensive part. It also holds exactly *one* pool type rather than both, because
 idle spinners take cores from whatever else is running — measured at ~25% when
 a channel pool was timed next to a live spin pool.
 
+## The crossover is at M=5, and it was published as M=2
+
+`SMMLA_MIN_ROWS` shipped as 2 because `SMMLA` emits two rows, so M≥2 stops
+wasting half of *the instruction*. The benchmarks only ever ran M=1 and M=8, so
+nothing ever tested that. Sweeping it, two runs, N=K=4096, single thread —
+SMMLA ÷ SDOT:
+
+| M | 1 | 2 | 3 | 4 | **5** | 6 | 7 | 8 | 12 | 16 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| run 1 | 0.70 | 0.72 | 0.73 | 0.78 | **1.54** | 1.45 | 1.44 | 1.47 | 1.17 | 1.40 |
+| run 2 | 0.73 | 0.71 | 0.73 | 0.76 | **1.47** | 1.45 | 1.49 | 1.48 | 1.11 | 1.50 |
+
+**The crossover is M=5.** At M=2, 3 and 4 the old rule chose `SMMLA` and gave up
+about 25% doing it.
+
+The reason is in the `SDOT` column, which peaks at M=4 (232–246 GOPS) and
+collapses at M=5 (149–157). `SDOT` tiles **4** rows, so M=4 fills it exactly and
+M=5 opens a second row-block that is mostly padding. `SMMLA` climbs steadily as
+its **8**-row tile fills. **The boundary is tile against tile, not instruction
+against instruction** — the same conclusion as the rest of this page, reached
+from the other direction. M=12 dipping back to 1.1× is the identical effect:
+12 = 8 + 4, half a tile.
+
+**Both dispatch constants in this repo were set at the value theory predicted
+and neither was measured on both sides.** The spin cliff was published at 12 and
+is at 20; this one was published at 2 and is at 5. In both cases the sweep
+stopped at the number that was expected to matter, which is exactly where it
+needed to keep going.
+
 ## What this is not
 
 - **The scalar reference is a correctness oracle, not a baseline.** It is a naive triple

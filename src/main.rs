@@ -188,6 +188,7 @@ fn main() {
     println!("Note 2: scalar is a naive triple loop with cache-hostile access to B. The");
     println!("        meaningful comparison is SMMLA vs SDOT; read the scalar multiples as an upper bound.");
 
+    crossover_demo();
     dispatch_demo();
     roofline_demo();
     unroll_demo();
@@ -645,6 +646,41 @@ fn roofline_demo() {
         g_mm / binding * 100.0,
         if mem_ceiling < mm_ceiling { "memory-bound" } else { "issue-bound" }
     );
+}
+
+/// Where is the crossover, actually?
+///
+/// `SMMLA_MIN_ROWS = 2` follows from the tile geometry — `SMMLA` emits two rows,
+/// so M=1 wastes half and M>=2 does not — and the benchmarks above only ever run
+/// M=1 and M=8. A boundary asserted at the value theory predicts, with no
+/// measurement on either side of it, is the same mistake that put the spin
+/// cliff at 12 instead of 20.
+fn crossover_demo() {
+    println!("\nWhere the dispatch crossover actually is (1 thread, N=K=4096)");
+    println!("┌─────┬──────────┬──────────┬───────────┬──────────┐");
+    println!("│  M  │   SDOT   │  SMMLA   │ SMMLA/SDOT│  picked  │");
+    println!("├─────┼──────────┼──────────┼───────────┼──────────┤");
+    for m in [1usize, 2, 3, 4, 5, 6, 7, 8, 12, 16] {
+        let (n, k) = (4096usize, 4096usize);
+        let ops = 2.0 * m as f64 * n as f64 * k as f64;
+        let (mut a, mut b) = (vec![0i8; m * k], vec![0i8; k * n]);
+        fill(&mut a, 0x9E3779B97F4A7C15);
+        fill(&mut b, 0xBF58476D1CE4E5B9);
+        let bt = pack_b_transposed(n, k, k, &b);
+        let (pa, mp, kp) = pack_a_smmla(m, k, &a);
+        let (pb, np) = pack_b_smmla(n, k, &b);
+        let mut c = vec![0i32; m * n];
+        let gd = bench_one(
+            || unsafe { gemm_sdot_tiled(m, n, k, k, &a, &bt, &mut c) }, ops, 0.6);
+        let gs = bench_one(
+            || unsafe { gemm_smmla_8x8(m, n, mp, np, kp, &pa, &pb, &mut c) }, ops, 0.6);
+        let picked = if choose(m) == Kernel::Smmla { "SMMLA" } else { "SDOT" };
+        let flag = if (gs > gd) != (choose(m) == Kernel::Smmla) { "  <-- rule disagrees" } else { "" };
+        println!("│ {:>3} │ {:>8.1} │ {:>8.1} │ {:>8.2}× │ {:<8} │{}",
+                 m, gd, gs, gs / gd, picked, flag);
+    }
+    println!("└─────┴──────────┴──────────┴───────────┴──────────┘");
+    println!("The rule should pick SMMLA exactly when the ratio is above 1.00.");
 }
 
 /// Show that dispatching on M wins in both regimes.
