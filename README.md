@@ -382,8 +382,9 @@ Three runs at each thread count, spin ÷ channel:
 | 24 | 0.82× | 0.75× | 0.82× |
 
 Bit-identical output throughout. **Peak goes from the 1364.5 this page started
-with to ~4400 GOPS, and the cliff is at 16 → 20 threads — exactly the
-performance-core count.** Past 16 the spinners have nowhere to sit but the
+with to 4000–4500 GOPS** — 3992 to 4522 observed across six runs, quoted as a
+range because a single figure would misrepresent a spread this wide — **and the
+cliff is at 16 → 20 threads, exactly the performance-core count.** Past 16 the spinners have nowhere to sit but the
 efficiency cores, and idle spinning stops being free the moment it competes
 with real work. The pool type is a choice with a regime, not an upgrade.
 
