@@ -593,6 +593,159 @@ pub unsafe fn gemm_smmla_pool(
     });
 }
 
+/// The same idea with the channels taken out.
+///
+/// `Pool` fixed thread *creation*, and measuring again showed dispatch is still
+/// 40.5–41.8% of a call: an mpsc send and recv per worker per job, on a job
+/// that is ~0.1ms long. Shrinking the B panel from 16 MiB to 1 MiB moved
+/// nothing (2379.8 vs 2307.2 GOPS), so the remainder is synchronisation and not
+/// memory.
+///
+/// Workers here spin on an atomic generation counter instead. Spinning burns
+/// cores while idle, which is the right trade only because dispatch is
+/// sub-millisecond and the pool is busy whenever it exists.
+pub struct SpinPool {
+    shared: std::sync::Arc<SpinShared>,
+    n: usize,
+}
+
+struct SpinShared {
+    /// Bumped once per job. Workers wake when it changes.
+    gen: std::sync::atomic::AtomicUsize,
+    /// Workers that have finished the current generation.
+    done: std::sync::atomic::AtomicUsize,
+    stop: std::sync::atomic::AtomicBool,
+    /// Written before `gen` is bumped (Release) and read after it is observed
+    /// (Acquire), so the counter is what publishes it.
+    job: std::cell::UnsafeCell<Option<*const (dyn Fn(usize) + Sync + 'static)>>,
+}
+
+/// Sound because `job` is only written while every worker is parked — `run`
+/// does not return until `done` reaches `n` — and the generation counter
+/// carries the release/acquire edge that publishes it.
+unsafe impl Sync for SpinShared {}
+unsafe impl Send for SpinShared {}
+
+impl SpinPool {
+    pub fn new(n: usize) -> Self {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let n = n.max(1);
+        let shared = std::sync::Arc::new(SpinShared {
+            gen: AtomicUsize::new(0),
+            done: AtomicUsize::new(0),
+            stop: AtomicBool::new(false),
+            job: std::cell::UnsafeCell::new(None),
+        });
+        // Worker 0 is the calling thread, so only n-1 are spawned.
+        for i in 1..n {
+            let sh = shared.clone();
+            std::thread::spawn(move || {
+                let mut seen = 0usize;
+                loop {
+                    let mut spins = 0u32;
+                    loop {
+                        if sh.stop.load(Ordering::Acquire) {
+                            return;
+                        }
+                        let g = sh.gen.load(Ordering::Acquire);
+                        if g != seen {
+                            seen = g;
+                            break;
+                        }
+                        spins += 1;
+                        // Spin briefly, then yield: a pool that outlives the
+                        // benchmark should not pin cores at 100% forever.
+                        if spins < 4096 {
+                            std::hint::spin_loop();
+                        } else {
+                            std::thread::yield_now();
+                        }
+                    }
+                    if let Some(f) = unsafe { *sh.job.get() } {
+                        unsafe { (*f)(i) };
+                    }
+                    sh.done.fetch_add(1, Ordering::Release);
+                }
+            });
+        }
+        SpinPool { shared, n }
+    }
+
+    pub fn threads(&self) -> usize {
+        self.n
+    }
+
+    /// Run `f(i)` for every worker index, with the caller acting as worker 0.
+    pub fn run<F: Fn(usize) + Sync>(&self, f: F) {
+        use std::sync::atomic::Ordering;
+        let borrowed: &(dyn Fn(usize) + Sync) = &f;
+        let erased: *const (dyn Fn(usize) + Sync + 'static) =
+            unsafe { std::mem::transmute(borrowed) };
+
+        unsafe { *self.shared.job.get() = Some(erased) };
+        self.shared.done.store(0, Ordering::Relaxed);
+        self.shared.gen.fetch_add(1, Ordering::Release);
+
+        // The caller does its own share instead of idling through the barrier.
+        f(0);
+
+        let want = self.n - 1;
+        let mut spins = 0u32;
+        while self.shared.done.load(Ordering::Acquire) < want {
+            spins += 1;
+            if spins < 4096 {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        unsafe { *self.shared.job.get() = None };
+    }
+}
+
+impl Drop for SpinPool {
+    fn drop(&mut self) {
+        self.shared
+            .stop
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.shared
+            .gen
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// `SMMLA` over the spin pool. Identical partition to [`gemm_smmla_pool`].
+///
+/// # Safety
+/// Requires FEAT_I8MM. Same packing contract as [`gemm_smmla`].
+pub unsafe fn gemm_smmla_spin(
+    m: usize, n: usize, mp: usize, np: usize, kp: usize,
+    pa: &[i8], pb: &[i8], c: &mut [i32], pool: &SpinPool,
+) {
+    let colpairs = np / 2;
+    let nthreads = pool.threads().min(colpairs.max(1));
+    if nthreads <= 1 {
+        gemm_smmla_8x8(m, n, mp, np, kp, pa, pb, c);
+        return;
+    }
+    let cp_chunk = colpairs.div_ceil(nthreads);
+    let cptr = CPtr(c.as_mut_ptr());
+    let clen = c.len();
+
+    pool.run(|t| {
+        let cp0 = t * cp_chunk;
+        if cp0 >= colpairs {
+            return;
+        }
+        let cp1 = ((t + 1) * cp_chunk).min(colpairs);
+        let cptr = cptr;
+        unsafe {
+            let cslice = std::slice::from_raw_parts_mut(cptr.0, clen);
+            smmla_8x8_colrange(m, n, mp, kp, pa, pb, cslice, cp0, cp1);
+        }
+    });
+}
+
 /// `SDOT` over the same persistent pool.
 ///
 /// Needed because the dispatch claim — that `SDOT` wins at M=1 — was measured

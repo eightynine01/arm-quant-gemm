@@ -351,6 +351,36 @@ back to remeasure.
 2308 GOPS is 45% of `12 × 424` single-core issue ceilings, so the multi-threaded
 path is now bound by something shared rather than by thread management.
 
+### The pool was not the end of it
+
+Measuring again after the pool fix: dispatch is *still* 40.5–41.8% of a call.
+An mpsc send and recv per worker per job, against a job of ~0.11ms.
+
+The obvious next suspect is memory, and it is wrong. Same op count, B panel
+shrunk 16× — 8×4096×4096 (B = 16 MiB) gives 2379.8 GOPS and 128×1024×1024
+(B = 1 MiB) gives 2307.2. **Nothing moves.** The remainder is synchronisation.
+
+`SpinPool` replaces the channels with an atomic generation counter, and the
+caller takes worker 0's share instead of idling at the barrier:
+
+| threads | channel pool | spin barrier | gain |
+|---:|---:|---:|---:|
+| 8 | 2094.7 | 2893.4 | 1.38× |
+| 12 | 2254.5 | **4073.4** | 1.81× |
+| 16 | 2238.1 | 1693.3 | **0.76×** |
+
+Bit-identical output. **Peak is now 4073 GOPS against the 1364.5 this page
+started with — 2.98× — and spinning loses outright at 16 threads.** Idle
+spinners are not free; once the machine is saturated they take cores from the
+work. The pool type is a choice with a regime, not an upgrade.
+
+**That last row nearly did not survive the measurement.** The first version of
+this table built both pools before timing either, so the spin workers were
+burning cores while the channel pool was being timed. It read 2.48× at 12
+threads and 1.16× at 16 — inflating the win and **hiding that spin loses**.
+Building and dropping each pool in its own scope fixed it. A benchmark that
+leaves another thread pool alive is measuring both.
+
 ### Re-checking the headline claim on the fixed harness
 
 The dispatch rule is the main result of this repo, and it had been measured with

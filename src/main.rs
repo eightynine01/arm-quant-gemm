@@ -340,6 +340,73 @@ fn thread_balance_demo() {
     println!("└──────────────────┴─────────┴──────────┴──────────┴───────────┘");
     println!("If SMMLA/SDOT stays below 1.0 at M=1 here too, the dispatch rule");
     println!("is a property of the instructions and not of the thread harness.");
+
+    // The pooled path reaches 45% of 12 single-core issue ceilings. Two
+    // candidates for the rest, and they predict different things:
+    //   pool dispatch  -> shows up with empty bodies, independent of shape
+    //   shared memory  -> vanishes when the B panel fits in cache
+    println!("\nWhat bounds the pooled path?");
+    let pool12 = Pool::new(12);
+    let reps = 2000;
+    let t0 = Instant::now();
+    for _ in 0..reps {
+        pool12.run(|_| {});
+    }
+    let dispatch = t0.elapsed().as_secs_f64() / reps as f64;
+    println!("  pool dispatch, empty bodies, 12 workers : {:>8.3}ms", dispatch * 1e3);
+
+    // Same op count, B panel 16 MiB vs 1 MiB.
+    for &(mm, nn, kk, tag) in &[
+        (8usize, 4096usize, 4096usize, "B = 16 MiB"),
+        (128, 1024, 1024, "B =  1 MiB"),
+    ] {
+        let ops2 = 2.0 * mm as f64 * nn as f64 * kk as f64;
+        let (mut a2, mut b2) = (vec![0i8; mm * kk], vec![0i8; kk * nn]);
+        fill(&mut a2, 0x9E3779B97F4A7C15);
+        fill(&mut b2, 0xBF58476D1CE4E5B9);
+        let (pa2, mp2, kp2) = pack_a_smmla(mm, kk, &a2);
+        let (pb2, np2) = pack_b_smmla(nn, kk, &b2);
+        let mut c2 = vec![0i32; mm * nn];
+        let g = bench_one(
+            || unsafe { gemm_smmla_pool(mm, nn, mp2, np2, kp2, &pa2, &pb2, &mut c2, &pool12) },
+            ops2, 0.8);
+        let per_call = ops2 / (g * 1e9);
+        println!("  {} {:>4}×{}×{}: {:>7.1} GOPS, {:>6.3}ms/call, dispatch = {:>4.1}%",
+                 tag, mm, nn, kk, g, per_call * 1e3, dispatch / per_call * 100.0);
+    }
+
+    // Replace the channels with a spin barrier and re-measure.
+    println!("\nSpin barrier vs channel pool");
+    println!("┌─────────┬───────────┬───────────┬─────────┬─────────┐");
+    println!("│ threads │ chan GOPS │ spin GOPS │  gain   │ correct │");
+    println!("├─────────┼───────────┼───────────┼─────────┼─────────┤");
+    let ops3 = 2.0 * m as f64 * n as f64 * k as f64;
+    for &nt in &[8usize, 12, 16] {
+        let mut c1 = vec![0i32; m * n];
+        let mut c2 = vec![0i32; m * n];
+        // The two pools are built and dropped in separate scopes on purpose.
+        // Holding both alive at once let the spin workers burn cores while the
+        // channel pool was being timed, which depressed the channel numbers by
+        // ~25% and inflated the ratio. Idle spinners are not free.
+        let gc = {
+            let cpool = Pool::new(nt);
+            unsafe { gemm_smmla_pool(m, n, mp, np, kp, &pa, &pb, &mut c1, &cpool) };
+            bench_one(
+                || unsafe { gemm_smmla_pool(m, n, mp, np, kp, &pa, &pb, &mut c1, &cpool) },
+                ops3, 0.8)
+        };
+        let gs = {
+            let spool = SpinPool::new(nt);
+            unsafe { gemm_smmla_spin(m, n, mp, np, kp, &pa, &pb, &mut c2, &spool) };
+            bench_one(
+                || unsafe { gemm_smmla_spin(m, n, mp, np, kp, &pa, &pb, &mut c2, &spool) },
+                ops3, 0.8)
+        };
+        let ok = c1 == c2;
+        println!("│ {:>7} │ {:>9.1} │ {:>9.1} │ {:>6.2}× │ {:>7} │",
+                 nt, gc, gs, gs / gc, if ok { "match" } else { "MISMATCH" });
+    }
+    println!("└─────────┴───────────┴───────────┴─────────┴─────────┘");
 }
 
 /// Does putting more loads in flight close any of the gap to the memory ceiling?
