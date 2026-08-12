@@ -436,7 +436,12 @@ fn thread_balance_demo() {
     println!("│ threads │ chan GOPS │ spin GOPS │  gain   │ correct │");
     println!("├─────────┼───────────┼───────────┼─────────┼─────────┤");
     let ops3 = 2.0 * m as f64 * n as f64 * k as f64;
-    for &nt in &[8usize, 12, 16] {
+    // Repeated because a single reading at 16 threads once showed spin losing
+    // 0.76x, and that number was written into the README and into
+    // SPIN_MAX_THREADS before it was checked. Five further runs all showed spin
+    // winning (1.28x-1.82x). Near saturation the run-to-run spread is wide
+    // enough that one sample decides nothing.
+    for &nt in &[8usize, 12, 16, 20, 24] {
         let mut c1 = vec![0i32; m * n];
         let mut c2 = vec![0i32; m * n];
         // The two pools are built and dropped in separate scopes on purpose.

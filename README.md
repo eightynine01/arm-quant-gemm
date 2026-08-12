@@ -363,23 +363,40 @@ shrunk 16× — 8×4096×4096 (B = 16 MiB) gives 2379.8 GOPS and 128×1024×1024
 `SpinPool` replaces the channels with an atomic generation counter, and the
 caller takes worker 0's share instead of idling at the barrier:
 
-| threads | channel pool | spin barrier | gain |
+Three runs at each thread count, spin ÷ channel:
+
+| threads | run 1 | run 2 | run 3 |
 |---:|---:|---:|---:|
-| 8 | 2094.7 | 2893.4 | 1.38× |
-| 12 | 2254.5 | **4073.4** | 1.81× |
-| 16 | 2238.1 | 1693.3 | **0.76×** |
+| 8 | 1.34× | 1.33× | 1.36× |
+| 12 | 1.71× | 1.65× | 1.76× |
+| 16 | 1.96× | 1.76× | 1.81× |
+| 20 | **0.79×** | **0.85×** | **0.79×** |
+| 24 | 0.82× | 0.75× | 0.82× |
 
-Bit-identical output. **Peak is now 4073 GOPS against the 1364.5 this page
-started with — 2.98× — and spinning loses outright at 16 threads.** Idle
-spinners are not free; once the machine is saturated they take cores from the
-work. The pool type is a choice with a regime, not an upgrade.
+Bit-identical output throughout. **Peak goes from the 1364.5 this page started
+with to ~4400 GOPS, and the cliff is at 16 → 20 threads — exactly the
+performance-core count.** Past 16 the spinners have nowhere to sit but the
+efficiency cores, and idle spinning stops being free the moment it competes
+with real work. The pool type is a choice with a regime, not an upgrade.
 
-**That last row nearly did not survive the measurement.** The first version of
-this table built both pools before timing either, so the spin workers were
-burning cores while the channel pool was being timed. It read 2.48× at 12
-threads and 1.16× at 16 — inflating the win and **hiding that spin loses**.
-Building and dropping each pool in its own scope fixed it. A benchmark that
-leaves another thread pool alive is measuring both.
+**The cliff was first published in the wrong place, from one reading.** An
+earlier version of this table put it at 12 → 16, on a single measurement where
+16 threads showed spin losing 0.76×, and `SPIN_MAX_THREADS` shipped as 12 on
+that basis. Five later runs at that same setting gave 1.28×–1.82×, all wins.
+Near saturation the run-to-run spread is wide enough that **one sample decides
+nothing** — while the 20- and 24-thread reversals repeat within 0.10× and are
+the real boundary.
+
+Two other ways this table was wrong before it was right, both worth naming:
+
+- The first version built both pools before timing either, so spin workers
+  burned cores while the channel pool was timed. It read 2.48× at 12 threads and
+  1.16× at 16 — inflating the win and hiding the loss entirely. Each pool now
+  lives in its own scope; a benchmark that leaves another thread pool alive is
+  measuring both.
+- The 20- and 24-thread rows did not exist at all. The table stopped at 16
+  because 16 is the core count, which is precisely the region where the answer
+  changes.
 
 ### Re-checking the headline claim on the fixed harness
 

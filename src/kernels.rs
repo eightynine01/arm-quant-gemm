@@ -271,10 +271,27 @@ pub fn choose(m: usize) -> Kernel {
 
 /// Above this thread count, spinning at the barrier costs more than it saves.
 ///
-/// Measured at 8x4096x4096: spin beats channels 1.38x at 8 threads and 1.81x at
-/// 12, then **loses 0.76x at 16**. Idle spinners are not free — once the machine
-/// is saturated they take cores away from the work.
-pub const SPIN_MAX_THREADS: usize = 12;
+/// This machine has 16 performance cores, and the cliff sits exactly there.
+/// Measured at 8x4096x4096, spin ÷ channel over three runs each:
+///
+/// ```text
+///      8 threads   1.34  1.33  1.36
+///     12           1.71  1.65  1.76
+///     16           1.96  1.76  1.81
+///     20           0.79  0.85  0.79   <- reverses
+///     24           0.82  0.75  0.82
+/// ```
+///
+/// Past 16 the spinners have nowhere to sit but the efficiency cores, and idle
+/// spinning stops being free the moment it competes with real work.
+///
+/// **This constant was 12 and that was wrong.** It came from a single reading
+/// where 16 threads showed spin losing 0.76x. Five later runs at the same
+/// setting gave 1.28x-1.82x, all wins — near saturation the run-to-run spread
+/// is wide enough that one sample decides nothing. The 20- and 24-thread
+/// reversals, by contrast, repeat within 0.10x and are what the cliff actually
+/// is.
+pub const SPIN_MAX_THREADS: usize = 16;
 
 /// Everything the repo measured, behind one call.
 ///
