@@ -6,7 +6,10 @@ the repository owner. Disclosed per hackathon transparency rules.
 ## What the AI wrote
 
 - `src/kernels.rs` — all kernels (scalar, SDOT, SMMLA), the packing routines, the
-  4×4 accumulator tiling, the column-partitioned threading, and the dispatch rule.
+  4×4 and 8×8 accumulator tiling, the column-partitioned threading, both thread
+  pools (`Pool`, `SpinPool`), the `Engine` dispatch, and both dispatch constants.
+- `src/roofline.rs` — the issue-ceiling and bandwidth measurements, including the
+  inline assembly.
 - `src/main.rs` — the verification harness and the benchmark loops.
 - `README.md` — drafted from the program's actual output.
 
@@ -32,6 +35,20 @@ Effectively all of the code in this repository was written by the AI.
 
 Every figure in the README is real output from this program on an Apple M2 Ultra,
 reproducible with the command in the README. Nothing was estimated, extrapolated,
-or written by hand. Where a measurement contradicted the initial hypothesis — the
-M=1 advantage disappearing above eight threads — the README reports the
-contradiction rather than the hypothesis.
+or written by hand.
+
+**Four claims were published and then retracted after re-measurement**, and the
+README keeps each retraction next to its replacement rather than quietly editing:
+
+- "memory-bound at 26% of a memory ceiling" — the issue ceiling was being measured
+  far too high. It is issue-bound at 85%.
+- "bandwidth, not issue rate" as the cause of the 16-thread regression — it was
+  per-call thread creation, 43–62% of the wall clock.
+- `SPIN_MAX_THREADS = 12`, from a single reading. The cliff is at 20.
+- `SMMLA_MIN_ROWS = 2`, from the instruction's geometry. Measured, it is 5, and
+  the old value made the dispatcher pick a 25%-slower kernel at M=2–4.
+
+The last two were caught by cloning this repository fresh and running the command
+the README gives — the AI's own working copy had accumulated state that hid them.
+Peak throughput is quoted as a range (4000–4500 GOPS) because six runs span that,
+and a single figure would claim precision the measurement does not have.
