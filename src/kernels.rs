@@ -593,6 +593,42 @@ pub unsafe fn gemm_smmla_pool(
     });
 }
 
+/// `SDOT` over the same persistent pool.
+///
+/// Needed because the dispatch claim — that `SDOT` wins at M=1 — was measured
+/// with both sides paying per-call thread creation. If that cost dominated,
+/// the comparison was partly measuring thread management rather than the
+/// instructions, so both sides have to be re-measured on equal, pooled footing.
+///
+/// # Safety
+/// Requires FEAT_DotProd. Same packing contract as [`gemm_sdot`].
+pub unsafe fn gemm_sdot_pool(
+    m: usize, n: usize, k: usize, kp: usize,
+    a: &[i8], bt: &[i8], c: &mut [i32], pool: &Pool,
+) {
+    let nthreads = pool.threads().min(n.max(1));
+    if nthreads <= 1 {
+        gemm_sdot_tiled(m, n, k, kp, a, bt, c);
+        return;
+    }
+    let chunk = n.div_ceil(nthreads);
+    let cptr = CPtr(c.as_mut_ptr());
+    let clen = c.len();
+
+    pool.run(|t| {
+        let c0 = t * chunk;
+        if c0 >= n {
+            return;
+        }
+        let c1 = ((t + 1) * chunk).min(n);
+        let cptr = cptr;
+        unsafe {
+            let cslice = std::slice::from_raw_parts_mut(cptr.0, clen);
+            sdot_colrange(m, n, k, kp, a, bt, cslice, c0, c1);
+        }
+    });
+}
+
 /// Raw `*mut i32` that threads may hold concurrently.
 ///
 /// Sound only because every thread writes a disjoint set of C elements — the

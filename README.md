@@ -342,6 +342,29 @@ back to remeasure.
 2308 GOPS is 45% of `12 × 424` single-core issue ceilings, so the multi-threaded
 path is now bound by something shared rather than by thread management.
 
+### Re-checking the headline claim on the fixed harness
+
+The dispatch rule is the main result of this repo, and it had been measured with
+both sides paying per-call thread creation — a cost now known to be 43–62% of
+the wall clock. A comparison where half the time is thread management is partly
+a measurement of the harness. So both sides were re-run pooled:
+
+| M×N×K | 1 | 4 | 8 | 12 | 16 threads |
+|---|---:|---:|---:|---:|---:|
+| 1×4096×4096 *(decode)* | 0.75× | 0.80× | 0.75× | 0.76× | **0.83×** |
+| 8×4096×4096 *(batch)* | 1.35× | 1.43× | 1.26× | 1.16× | 1.13× |
+
+**The claim holds, and it got sharper.** On the spawn harness the M=1 ratio drifted
+to 0.93× at 16 threads, which read like the penalty evaporating with enough
+cores. It was thread-creation noise: pooled, the ratio stays in a 0.75–0.83 band
+across every thread count. `SMMLA` loses at M=1 whatever the core count, and the
+loss does not shrink with parallelism.
+
+Decode throughput improved too — pooled `SDOT` at M=1 peaks at 364 GOPS against
+226 before, so the shape that matters most for token generation gained 1.6×.
+
+Cleaning a harness usually costs you a result. This one paid.
+
 ## What this is not
 
 - **The scalar reference is a correctness oracle, not a baseline.** It is a naive triple

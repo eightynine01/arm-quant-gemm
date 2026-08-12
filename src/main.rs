@@ -305,6 +305,41 @@ fn thread_balance_demo() {
         );
     }
     println!("└─────────┴───────────┴───────────┴─────────┴─────────┘");
+
+    // The dispatch claim was measured with both sides paying per-call thread
+    // creation. If that cost dominated, the ratio was partly a measurement of
+    // thread management. Re-run it on equal, pooled footing.
+    println!("\nDispatch rule re-measured on the pool (spawn cost removed)");
+    println!("┌──────────────────┬─────────┬──────────┬──────────┬───────────┐");
+    println!("│ M×N×K            │ threads │   SDOT   │  SMMLA   │ SMMLA/SDOT│");
+    println!("├──────────────────┼─────────┼──────────┼──────────┼───────────┤");
+    for &(mm, nn, kk) in &[(1usize, 4096usize, 4096usize), (8, 4096, 4096)] {
+        let ops2 = 2.0 * mm as f64 * nn as f64 * kk as f64;
+        let (mut a2, mut b2) = (vec![0i8; mm * kk], vec![0i8; kk * nn]);
+        fill(&mut a2, 0x9E3779B97F4A7C15);
+        fill(&mut b2, 0xBF58476D1CE4E5B9);
+        let bt2 = pack_b_transposed(nn, kk, kk, &b2);
+        let (pa2, mp2, kp2) = pack_a_smmla(mm, kk, &a2);
+        let (pb2, np2) = pack_b_smmla(nn, kk, &b2);
+        let mut cd = vec![0i32; mm * nn];
+        let mut cs = vec![0i32; mm * nn];
+        for &nt in &[1usize, 4, 8, 12, 16] {
+            let pool = Pool::new(nt);
+            let gd = bench_one(
+                || unsafe { gemm_sdot_pool(mm, nn, kk, kk, &a2, &bt2, &mut cd, &pool) },
+                ops2, 0.6);
+            let gs = bench_one(
+                || unsafe { gemm_smmla_pool(mm, nn, mp2, np2, kp2, &pa2, &pb2, &mut cs, &pool) },
+                ops2, 0.6);
+            let label = if nt == 1 { format!("{}×{}×{}", mm, nn, kk) } else { String::new() };
+            println!("│ {:<16} │ {:>7} │ {:>8.1} │ {:>8.1} │ {:>8.2}× │",
+                     label, nt, gd, gs, gs / gd);
+        }
+        println!("├──────────────────┼─────────┼──────────┼──────────┼───────────┤");
+    }
+    println!("└──────────────────┴─────────┴──────────┴──────────┴───────────┘");
+    println!("If SMMLA/SDOT stays below 1.0 at M=1 here too, the dispatch rule");
+    println!("is a property of the instructions and not of the thread harness.");
 }
 
 /// Does putting more loads in flight close any of the gap to the memory ceiling?
