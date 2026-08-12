@@ -279,6 +279,43 @@ the same accumulators. What located that one was not magnitude but **slope** —
 bandwidth came out rising with footprint, and bandwidth that improves as the
 working set leaves cache is impossible.
 
+## Why 16 threads loses to 8
+
+The scaling table shows throughput *falling* from 8 threads to 16 on a machine
+with 16 performance cores. An unexplained regression in a published table is
+worth chasing, and the two obvious causes predict different things about the
+spread of per-thread times: efficiency-core placement gives a few stragglers
+several times slower than the rest, contention slows everyone equally.
+
+Timing each worker separately at 8×4096×4096:
+
+| threads | fastest | slowest | slow/fast | wall | spawn/join alone |
+|---:|---:|---:|---:|---:|---:|
+| 8 | 0.13ms | 0.17ms | 1.26× | 0.28ms | 0.12ms |
+| 12 | 0.08ms | 0.11ms | 1.43× | 0.30ms | 0.14ms |
+| 16 | 0.05ms | 0.07ms | 1.38× | 0.32ms | 0.16ms |
+| 20 | 0.04ms | 0.05ms | 1.22× | 0.42ms | 0.18ms |
+| 24 | 0.03ms | 0.06ms | 1.83× | 0.42ms | 0.26ms |
+
+**Neither.** The spread stays between 1.2× and 1.8×, nowhere near the ~3× that
+efficiency-core placement would produce, so the work is landing on performance
+cores. And the workers are not slowing down as threads are added — each one gets
+proportionally faster, which is what good scaling looks like.
+
+What is not scaling is everything else. The last column is the same
+`std::thread::scope` with **empty bodies**, and it accounts for **43% to 62% of
+the wall clock**. `gemm_smmla_mt` creates fresh OS threads on every call, so
+adding threads buys less compute per thread while paying more for thread
+creation. Past roughly 8–12 the second term wins.
+
+At 8×4096×4096 the entire GEMM is ~0.3ms — the same order as spawning 16
+threads. This is a small-batch decode shape, which is exactly where the
+threading is supposed to help.
+
+The fix is a persistent pool rather than per-call spawn. **Not implemented
+here**: the measurement is reported, the remedy is not yet built, and quoting a
+speedup for something unbuilt is how the retracted claim above happened.
+
 ## What this is not
 
 - **The scalar reference is a correctness oracle, not a baseline.** It is a naive triple

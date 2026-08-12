@@ -191,6 +191,94 @@ fn main() {
     dispatch_demo();
     roofline_demo();
     unroll_demo();
+    thread_balance_demo();
+}
+
+/// Why does 16 threads lose to 8?
+///
+/// The scaling table shows throughput *falling* from 8 threads to 16 on a
+/// machine with 16 performance cores, which is the kind of anomaly that has to
+/// be explained rather than reported. Two candidates: work landing on the 8
+/// efficiency cores, or contention once both performance clusters are busy.
+///
+/// They predict different things about the *spread* of per-thread times, so
+/// timing each worker separates them. Efficiency-core placement gives a few
+/// stragglers several times slower than the rest; contention slows everyone
+/// roughly equally.
+fn thread_balance_demo() {
+    let (m, n, k) = (8usize, 4096usize, 4096usize);
+    let (mut a, mut b) = (vec![0i8; m * k], vec![0i8; k * n]);
+    fill(&mut a, 0x9E3779B97F4A7C15);
+    fill(&mut b, 0xBF58476D1CE4E5B9);
+    let (pa, mp, kp) = pack_a_smmla(m, k, &a);
+    let (pb, np) = pack_b_smmla(n, k, &b);
+    let mut c = vec![0i32; m * n];
+
+    println!("\nPer-thread time at {}x{}x{} (equal column chunks)", m, n, k);
+    println!("┌─────────┬──────────┬──────────┬──────────┬──────────┬────────┐");
+    println!("│ threads │  fastest │  slowest │ slow/fast│ wall  ms │  GOPS  │");
+    println!("├─────────┼──────────┼──────────┼──────────┼──────────┼────────┤");
+
+    for &nt in &[8usize, 12, 16, 20, 24] {
+        let colpairs = np / 2;
+        let cp_chunk = colpairs.div_ceil(nt);
+        let times = std::sync::Mutex::new(Vec::<f64>::new());
+        let cp = c.as_mut_ptr() as usize;
+        let clen = c.len();
+
+        let t0 = Instant::now();
+        std::thread::scope(|s| {
+            for t in 0..nt {
+                let cp0 = t * cp_chunk;
+                if cp0 >= colpairs {
+                    break;
+                }
+                let cp1 = ((t + 1) * cp_chunk).min(colpairs);
+                let times = &times;
+                let (pa, pb) = (&pa, &pb);
+                s.spawn(move || {
+                    let t1 = Instant::now();
+                    unsafe {
+                        let cs = std::slice::from_raw_parts_mut(cp as *mut i32, clen);
+                        smmla_8x8_colrange(m, n, mp, kp, pa, pb, cs, cp0, cp1);
+                    }
+                    times.lock().unwrap().push(t1.elapsed().as_secs_f64());
+                });
+            }
+        });
+        let wall = t0.elapsed().as_secs_f64();
+
+        let mut v = times.into_inner().unwrap();
+        v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let (fast, slow) = (v[0], v[v.len() - 1]);
+        let gops = 2.0 * m as f64 * n as f64 * k as f64 / wall / 1e9;
+        println!(
+            "│ {:>7} │ {:>7.2}ms │ {:>7.2}ms │ {:>7.2}× │ {:>7.2}  │ {:>6.1} │",
+            nt, fast * 1e3, slow * 1e3, slow / fast, wall * 1e3, gops
+        );
+    }
+    println!("└─────────┴──────────┴──────────┴──────────┴──────────┴────────┘");
+
+    // The gap between the slowest worker and the wall clock is not compute, so
+    // measure what it is: the same scope with empty bodies.
+    println!("\nSpawn/join cost alone (identical scope, empty bodies)");
+    println!("┌─────────┬───────────┐");
+    println!("│ threads │  overhead │");
+    println!("├─────────┼───────────┤");
+    for &nt in &[8usize, 12, 16, 20, 24] {
+        let reps = 200;
+        let t0 = Instant::now();
+        for _ in 0..reps {
+            std::thread::scope(|s| {
+                for _ in 0..nt {
+                    s.spawn(|| {});
+                }
+            });
+        }
+        println!("│ {:>7} │ {:>7.2}ms │", nt, t0.elapsed().as_secs_f64() / reps as f64 * 1e3);
+    }
+    println!("└─────────┴───────────┘");
+    println!("16 performance cores + 8 efficiency cores on this machine.");
 }
 
 /// Does putting more loads in flight close any of the gap to the memory ceiling?
