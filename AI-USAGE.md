@@ -19,9 +19,11 @@ Effectively all of the code in this repository was written by the AI.
 - The standard of evidence: correctness verified against a scalar reference before
   any timing is reported, odd shapes included to exercise padding, and claims in the
   README stated no more strongly than the measurements support.
-- The instruction to measure the multi-threaded behaviour rather than assume it —
-  which is what turned up the crossover reversal at 16 threads and corrected an
-  earlier, overconfident version of the central claim.
+- The instruction to keep attacking the kernel rather than stop at the first
+  publishable result. That is what produced the 8×8 tile, which in turn showed the
+  original headline finding (a 21% SMMLA penalty at M=1) was mostly an artifact of
+  the weaker 4×4 kernel. The README reports the reversal rather than the first
+  version.
 
 ## Provenance of the numbers
 

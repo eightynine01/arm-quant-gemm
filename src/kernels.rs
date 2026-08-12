@@ -171,26 +171,20 @@ pub unsafe fn gemm_smmla(
     }
 }
 
-/// Which kernel wins depends on M, and the crossover is not where you would
-/// guess. `SMMLA` always produces two output rows; at M=1 the second row is
-/// padding, so half the multiply-accumulate work is discarded and `SDOT` —
-/// which computes exactly one row — comes out ahead despite doing half the
-/// MACs per instruction.
+/// Pick a kernel by shape.
 ///
-/// That matters because M=1 is the LLM decode step: every token after the
-/// prompt is a matrix-vector product. A kernel chosen for prefill throughput
-/// is the wrong kernel for the part that runs thousands of times.
+/// This rule was built on a measurement that later shrank. With the 4×4 tile,
+/// `SMMLA` lost 21% to `SDOT` at M=1 and dispatching was worth 1.27×. With the
+/// 8×8 tile the two are tied at M=1 (0.93–1.02× across thread counts) and
+/// dispatching is worth 1.03×.
 ///
-/// The size of the effect is thread-dependent, and measuring that mattered:
-/// at M=1 the SMMLA/SDOT ratio runs 0.79× on one thread, 0.94× on eight, and
-/// 1.05× on sixteen. Past roughly eight threads the decode shape is bound by
-/// memory bandwidth rather than issue rate, so SMMLA's discarded half stops
-/// costing anything.
+/// The underlying asymmetry is real but small: `SMMLA` always emits two output
+/// rows, so at M=1 the second is padding. Widening the tile makes that waste
+/// worse (8×8 spans four row pairs, three of them padding at M=1) while making
+/// load amortisation better, and the two roughly cancel.
 ///
-/// The rule below stays simple anyway, because the asymmetry favours it:
-/// picking SDOT at M=1 gives up at most ~5% (16 threads) and gains up to 27%
-/// (1 thread). A thread-count-aware rule would recover that 5% and is not
-/// worth the extra state.
+/// Kept because it costs one integer compare and is never negative. Not kept
+/// because it is important — fixing the register tile mattered ~10× more.
 pub const SMMLA_MIN_ROWS: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,6 +228,88 @@ pub unsafe fn gemm_smmla_blocked(
     }
 }
 
+/// 8×8 register-tiled `SMMLA` — the optimization the load count actually points at.
+///
+/// The 4×4 kernel issues four `SMMLA`s against four 16-byte loads per k-step:
+/// one load per instruction. If the core sustains two 128-bit loads per cycle
+/// that caps it at two `SMMLA`/cycle no matter how well anything caches, which
+/// is why blocking N changed nothing.
+///
+/// An 8×8 tile loads four A vectors and four B vectors and issues **sixteen**
+/// `SMMLA`s from them — 2 instructions per load instead of 1. Cost is register
+/// pressure: 16 accumulators plus 8 operands is 24 of the 32 NEON registers,
+/// which fits, but leaves little room for the compiler to spill into.
+///
+/// # Safety
+/// Requires FEAT_I8MM. Same packing contract as [`gemm_smmla`].
+#[target_feature(enable = "i8mm")]
+pub unsafe fn gemm_smmla_8x8(
+    m: usize, n: usize, mp: usize, np: usize, kp: usize,
+    pa: &[i8], pb: &[i8], c: &mut [i32],
+) {
+    smmla_8x8_colrange(m, n, mp, kp, pa, pb, c, 0, np / 2);
+}
+
+/// 8×8 tiling restricted to `[cp0_lo, cp1_hi)` column pairs, so the threaded
+/// path gets the same register tiling as the single-threaded one.
+///
+/// # Safety
+/// Requires FEAT_I8MM. Same packing contract as [`gemm_smmla`].
+#[target_feature(enable = "i8mm")]
+pub unsafe fn smmla_8x8_colrange(
+    m: usize, n: usize, mp: usize, kp: usize,
+    pa: &[i8], pb: &[i8], c: &mut [i32], cp0_lo: usize, cp1_hi: usize,
+) {
+    let kblocks = kp / 8;
+    let rowpairs = mp / 2;
+    let colpairs = cp1_hi;
+
+    let mut rp0 = 0;
+    while rp0 < rowpairs {
+        let mut cp0 = cp0_lo;
+        while cp0 < cp1_hi {
+            let mut acc = [[vdupq_n_s32(0); 4]; 4];
+
+            // Clamp so the pointer arithmetic stays inside the packed panels.
+            // Tiles past the real edge compute garbage; `store_tile` drops them
+            // because their row/col indices are >= m/n.
+            let mut ap = [std::ptr::null::<i8>(); 4];
+            let mut bp = [std::ptr::null::<i8>(); 4];
+            for i in 0..4 {
+                ap[i] = pa.as_ptr().add((rp0 + i).min(rowpairs - 1) * kblocks * 16);
+                bp[i] = pb.as_ptr().add((cp0 + i).min(colpairs - 1) * kblocks * 16);
+            }
+
+            for kb in 0..kblocks {
+                let off = kb * 16;
+                let av = [
+                    vld1q_s8(ap[0].add(off)), vld1q_s8(ap[1].add(off)),
+                    vld1q_s8(ap[2].add(off)), vld1q_s8(ap[3].add(off)),
+                ];
+                let bv = [
+                    vld1q_s8(bp[0].add(off)), vld1q_s8(bp[1].add(off)),
+                    vld1q_s8(bp[2].add(off)), vld1q_s8(bp[3].add(off)),
+                ];
+                for i in 0..4 {
+                    for j in 0..4 {
+                        acc[i][j] = vmmlaq_s32(acc[i][j], av[i], bv[j]);
+                    }
+                }
+            }
+
+            for i in 0..4 {
+                for j in 0..4 {
+                    if rp0 + i < rowpairs && cp0 + j < colpairs {
+                        store_tile(acc[i][j], (rp0 + i) * 2, (cp0 + j) * 2, m, n, c);
+                    }
+                }
+            }
+            cp0 += 4;
+        }
+        rp0 += 4;
+    }
+}
+
 /// Raw `*mut i32` that threads may hold concurrently.
 ///
 /// Sound only because every thread writes a disjoint set of C elements — the
@@ -259,7 +335,7 @@ pub unsafe fn gemm_smmla_mt(
     let colpairs = np / 2;
     let nthreads = threads.max(1).min(colpairs.max(1));
     if nthreads == 1 {
-        gemm_smmla(m, n, mp, np, kp, pa, pb, c);
+        gemm_smmla_8x8(m, n, mp, np, kp, pa, pb, c);
         return;
     }
     let cp_chunk = colpairs.div_ceil(nthreads);
@@ -278,7 +354,7 @@ pub unsafe fn gemm_smmla_mt(
                 // otherwise capture the bare `*mut i32`, which is not Send.
                 let cptr = cptr;
                 let cslice = std::slice::from_raw_parts_mut(cptr.0, clen);
-                smmla_colrange(m, n, mp, kp, pa, pb, cslice, cp0, cp1);
+                smmla_8x8_colrange(m, n, mp, kp, pa, pb, cslice, cp0, cp1);
             });
         }
     });
