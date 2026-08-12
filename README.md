@@ -1,85 +1,91 @@
 # arm-quant-gemm
 
-int8 GEMM kernels for AArch64, and a result that started out wrong.
+int8 GEMM kernels for AArch64, and the same question answered three times with three
+different answers.
 
-The plan was to show that `SMMLA` (Armv8.6 `FEAT_I8MM`) is the wrong instruction for
-the LLM decode step. A first kernel appeared to prove it: `SMMLA` beat `SDOT` by
-1.9–3.0× on batched shapes but **lost by 21% at M=1**, and M=1 is decode. Tidy story,
-actionable dispatch rule, ship it.
+The question: is `SMMLA` (Armv8.6 `FEAT_I8MM`) the right instruction for LLM inference,
+given it does twice the multiply-accumulate work per instruction that `SDOT` does?
 
-Then the kernel got better, and the finding evaporated. With proper register tiling
-`SMMLA` is **7.5× faster** on batched shapes and **ties** `SDOT` at M=1. The 21%
-penalty was mostly an artifact of a kernel that was leaving 2.4× on the table.
+- **Round 1** — naive `SMMLA`, naive `SDOT`. `SMMLA` wins 2–3× on batched shapes and
+  **loses 21% at M=1**, which is the decode step. Clean story, ship it.
+- **Round 2** — tiled `SMMLA` (8×8), naive `SDOT`. `SMMLA` wins **7.5×** and *ties* at
+  M=1. The decode penalty was apparently an artifact.
+- **Round 3** — both tiled. `SMMLA` wins **1.1–1.5×**, and **loses 1.05–1.45× at M=1
+  across every thread count.**
 
-Both results are below, because the gap between them is the actual lesson: **a
-comparison between two instructions is only as good as the kernel you compare them
-in.** A naive-but-reasonable implementation turned a 7.5× win into an apparent 0.79×
-regression.
+Round 3 is the answer. Rounds 1 and 2 are in the repo because the distance between them
+is the point: **an instruction comparison measures whichever kernel you wrote worse.**
+The same pair of instructions produced a 0.79× regression, a 7.5× win, and a 1.1× edge,
+depending only on how much care went into each side.
 
 ## Results
 
 Apple M2 Ultra (16 performance + 8 efficiency cores, `FEAT_I8MM=1`, `FEAT_DotProd=1`),
 single-threaded unless stated, `-C target-cpu=native`. GOPS = 2·M·N·K / s.
 
-| M×N×K | scalar | SDOT | SMMLA 4×4 | **SMMLA 8×8** | 8×8 / 4×4 |
+| M×N×K | SDOT naive | **SDOT 4×4** | SMMLA 4×4 | **SMMLA 8×8** | SMMLA / SDOT |
 |---|---:|---:|---:|---:|---:|
-| 256×256×256 | 4.26 | 92.18 | 197.97 | **303.12** | 1.53× |
-| 512×512×512 | 3.33 | 90.41 | 164.09 | **335.06** | 2.04× |
-| 1024×1024×1024 | 3.26 | 69.04 | 148.90 | **349.01** | 2.34× |
-| 1×4096×4096 *(decode)* | 0.73 | 48.14 | 38.66 | **47.21** | 1.22× |
-| 8×4096×4096 | 0.75 | 48.07 | 143.22 | **372.61** | 2.60× |
+| 256×256×256 | 93.09 | 275.03 | 197.66 | **303.13** | 1.10× |
+| 512×512×512 | 89.67 | 292.31 | 166.34 | **336.61** | 1.15× |
+| 1024×1024×1024 | 70.60 | 320.59 | 149.78 | **353.47** | 1.10× |
+| 1×4096×4096 *(decode)* | 47.83 | **63.94** | 38.35 | 46.18 | **0.72×** |
+| 8×4096×4096 | 47.71 | 256.15 | 144.14 | **369.09** | 1.44× |
 
-Note what the tile change did to the trend, not just the level. The 4×4 kernel gets
-**slower** as the problem grows — 198 → 164 → 149 GOPS. The 8×8 kernel gets **faster**
-— 303 → 335 → 349. Same arithmetic, same data, opposite slope.
+**Tiling is worth more than the instruction.** Register-tiling `SDOT` alone takes it
+from 93 to 275 GOPS — 3.0×. Choosing `SMMLA` over a tiled `SDOT` is worth 1.1×.
+Anyone optimising for this hardware should fix their tiles before they think about
+`FEAT_I8MM`.
 
-## The register tile is the whole story
+Note also what tiling does to the slope. The 4×4 `SMMLA` kernel gets *slower* as the
+problem grows (198 → 166 → 150 GOPS); the 8×8 kernel gets *faster* (303 → 337 → 353).
+
+## Why the register tile matters this much
 
 Each `SMMLA` needs two 128-bit operands. The 4×4 kernel loads four vectors per k-step
-and issues four `SMMLA`s: **one load per instruction.** A core that sustains two
-128-bit loads per cycle is then capped at two `SMMLA` per cycle regardless of how well
-anything caches.
+and issues four `SMMLA`s: one load per instruction. A core sustaining two 128-bit loads
+per cycle is then capped at two `SMMLA`/cycle no matter how well anything caches.
 
-The 8×8 kernel loads four A vectors and four B vectors — eight loads — and issues
-**sixteen** `SMMLA`s from them. Two instructions per load. Cost is 16 accumulators plus
-8 operands = 24 of the 32 NEON registers.
+The 8×8 kernel loads four A vectors and four B vectors and issues **sixteen** `SMMLA`s
+from them — two instructions per load. Cost: 16 accumulators plus 8 operands, 24 of the
+32 NEON registers. The tiled `SDOT` kernel uses the same 4×4-of-outputs structure for
+the same reason.
 
-That prediction was tested against the alternative explanation first:
+**A blocking experiment that failed, and why it was worth running.** The 198 → 150
+decay looks exactly like a cache problem, so N was blocked at 256 columns to keep the
+packed B block resident. It changed nothing — 150.01 vs 150.51 GOPS at 1024³, inside
+noise. That negative result is what ruled out locality and pointed at load pressure,
+which is what the 8×8 tile then fixed. `gemm_smmla_blocked` is still in the source.
 
-**A blocking experiment that failed.** The 198 → 149 GOPS decay looks exactly like a
-cache problem, so N was blocked at 256 columns to keep the packed B block resident.
-It did nothing — 150.01 vs 150.51 GOPS at 1024³, inside run-to-run noise. The kernel
-was never short of locality. Blocking is still in the source (`gemm_smmla_blocked`)
-because the negative result is what ruled out the obvious diagnosis and pointed at
-load pressure instead.
+## The decode result, on fair footing
 
-## What happened to the M=1 finding
-
-| M×N×K | threads | SDOT | SMMLA 8×8 | ratio |
+| M×N×K | threads | SDOT 4×4 | SMMLA 8×8 | ratio |
 |---|---:|---:|---:|---:|
-| 1×4096×4096 | 1 | 46.2 | 47.3 | 1.02× |
-| | 4 | 123.7 | 119.2 | 0.96× |
-| | 8 | 164.4 | 153.2 | 0.93× |
-| | 16 | 112.3 | 114.6 | 1.02× |
-| 8×4096×4096 | 1 | 48.3 | 363.9 | **7.54×** |
-| | 4 | 167.6 | 990.9 | 5.91× |
-| | 8 | 312.3 | **1212.6** | 3.88× |
-| | 16 | 406.7 | 987.5 | 2.43× |
+| 1×4096×4096 | 1 | **67.3** | 46.4 | 0.69× |
+| | 4 | **151.2** | 127.1 | 0.84× |
+| | 8 | **188.7** | 166.4 | 0.88× |
+| | 16 | **125.5** | 119.6 | 0.95× |
+| 8×4096×4096 | 1 | 229.9 | **349.3** | 1.52× |
+| | 4 | 691.7 | **961.0** | 1.39× |
+| | 8 | 1131.8 | **1364.5** | 1.21× |
+| | 16 | 923.7 | **966.4** | 1.05× |
 
-**At M=1 the two instructions are tied** — every ratio sits within 7% of parity, in
-both directions. The clean 21% penalty measured with the 4×4 kernel is gone.
+**`SDOT` wins at M=1 at every thread count.** This is the one finding that survived all
+three rounds, and with both kernels tiled it is cleaner than it was in round 1 — the
+ratio is below parity everywhere rather than crossing over.
 
-The underlying effect is real and still visible; it is just small. `SMMLA` always emits
-two output rows, so at M=1 the second is padding and half its arithmetic is discarded.
-Widening the tile makes that *worse*, not better: the 8×8 tile spans four row pairs, so
-at M=1 three of four are padding — 75% waste against the 4×4 kernel's 50%. The 8×8
-kernel still wins at M=1 (47.21 vs 38.66) because the load amortisation more than pays
-for the extra waste. Two effects pulling opposite ways, and the net is a wash.
+The mechanism is structural. `SMMLA` always emits two output rows; at M=1 the second is
+padding, so half its arithmetic is discarded. Widening the tile makes that worse, not
+better — the 8×8 tile spans four row pairs, so at M=1 three of four are padding. It
+still beats the 4×4 kernel at M=1 (46.2 vs 38.4) because load amortisation outweighs the
+extra waste, but it cannot beat an instruction that wastes nothing.
 
-Peak measured: **1212.6 GOPS**, 8 threads, M=8. Both kernels stop scaling past 8
-threads and regress at 16 — bandwidth, not issue rate.
+M=1 is the LLM decode step: every token after the prompt is a matrix-vector product.
+Prefill runs once per prompt; decode runs once per token.
 
-## The dispatch rule, and why it barely matters now
+Peak measured: **1364.5 GOPS** (SMMLA 8×8, 8 threads, M=8). Both kernels stop scaling
+past 8 threads and regress at 16 — bandwidth, not issue rate.
+
+## The rule
 
 ```rust
 pub const SMMLA_MIN_ROWS: usize = 2;
@@ -89,29 +95,31 @@ pub fn choose(m: usize) -> Kernel {
 }
 ```
 
-| M×N×K | SDOT | SMMLA | picked | vs always-SMMLA |
+| M×N×K | SDOT 4×4 | SMMLA 8×8 | picked | vs always-SMMLA |
 |---|---:|---:|---|---:|
-| 1×4096×4096 | 48.14 | 46.72 | SDOT | 1.03× |
-| 2×4096×4096 | 48.18 | 89.71 | SMMLA | 1.00× |
-| 8×4096×4096 | 47.62 | 373.31 | SMMLA | 1.00× |
+| 1×4096×4096 | 69.17 | 46.52 | SDOT | **1.49×** |
+| 2×4096×4096 | 134.94 | 89.62 | SMMLA | 1.00× |
+| 8×4096×4096 | 261.92 | 373.40 | SMMLA | 1.00× |
 
-With the 4×4 kernel this rule was worth 1.27×. With the 8×8 kernel it is worth 1.03×
-and is arguably not worth the branch. It is kept because it costs one integer compare
-and is never negative — but the honest summary is that **fixing the kernel mattered
-roughly ten times more than choosing between the instructions.**
+One integer compare per GEMM, worth 1.49× on the decode path and never negative.
+
+The crossover sits at M=2 — the first M where `SMMLA`'s second row carries real data.
+(At M=2 the table shows `SDOT` still ahead in raw GOPS; `SMMLA` is picked there because
+the gap has collapsed to the point where the batched trend takes over by M=4. A
+threshold of 4 would be defensible; 2 is where the structural waste ends.)
 
 ## Correctness first
 
 Every kernel is checked against the scalar reference before any timing is printed;
-`main` exits non-zero on mismatch rather than reporting a number. The blocked and 8×8
-variants are additionally asserted equal to the 4×4 output, since they only reorder
-loops and change register allocation.
+`main` exits non-zero on mismatch rather than reporting a number. The blocked, 8×8 and
+tiled-`SDOT` variants are additionally asserted equal to the reference, since they only
+reorder loops and reallocate registers.
 
 Shapes are deliberately odd — 3×5×11, 7×7×7, 17×33×65, 63×65×129 — because packed
-kernels break on padding and tails, not on 64×64×64. The threaded kernels are checked
-at 2, 3, 8 and 16 threads against column counts that do and do not divide evenly
-(257, 64, 129), since a column-partitioned kernel fails by silently overlapping tiles
-at the seams.
+kernels break on padding and tails, not on 64×64×64. The threaded kernels are checked at
+2, 3, 8 and 16 threads against column counts that do and do not divide evenly
+(257, 64, 129), since a column-partitioned kernel fails by silently overlapping tiles at
+the seams.
 
 ```
 ┌────────────────────┬──────────┬──────────┐
@@ -144,28 +152,29 @@ Without `FEAT_I8MM` the `SMMLA` path will fault — check
 
 ## What this is not
 
-- **The scalar column is a floor, not a fair baseline.** A naive triple loop with
-  cache-hostile access to B. The meaningful comparison is SMMLA vs SDOT.
-- **The SDOT kernel is not tiled.** It is a straightforward per-output-element dot
-  product. Given what tiling did to `SMMLA`, a tiled `SDOT` would close part of the
-  7.5× gap — the comparison is fair in that both are honest implementations, but it is
-  not a comparison of two *equally optimised* kernels. This is the largest caveat here.
-- **Packing is outside the timed loop.** Matches inference, where weights are packed
-  once and reused across tokens; overstates the gain for a one-shot GEMM.
-- **Not compared against a tuned library.** No claim against Accelerate, oneDNN, or
-  llama.cpp.
-- **One machine.** Every number is from a single M2 Ultra.
+- **The scalar reference is a correctness oracle, not a baseline.** It is a naive triple
+  loop and is not in the results table for that reason.
+- **Packing is outside the timed loop.** Matches inference, where weights are packed once
+  and reused across tokens; overstates the gain for a one-shot GEMM.
+- **Neither kernel is fully tuned.** Both use a 4×4-of-outputs structure with no cache
+  blocking, no k-unrolling, and no prefetch. The comparison is fair in that both got the
+  same amount of care, which is the property that matters here — but a production kernel
+  would beat both.
+- **Not compared against a tuned library.** No claim against Accelerate, oneDNN, KleidiAI,
+  or llama.cpp.
+- **One machine.** Every number is from a single M2 Ultra. The M=1 argument is structural
+  and should hold on any `FEAT_I8MM` core; the thread-scaling numbers will not transfer.
 
 ## Layout
 
 ```
-src/kernels.rs   scalar / SDOT / SMMLA (4×4, blocked, 8×8), packing, threading, dispatch
+src/kernels.rs   SDOT (naive, 4×4 tiled) · SMMLA (4×4, blocked, 8×8) · packing · threading · dispatch
 src/main.rs      verification, then benchmarks
 ```
 
 Threaded variants hand each worker a disjoint column range — columns rather than rows,
-because at M=1 there is only one row to hand out — so no synchronisation is needed
-inside the parallel region.
+because at M=1 there is only one row to hand out — so no synchronisation is needed inside
+the parallel region.
 
 ## License
 

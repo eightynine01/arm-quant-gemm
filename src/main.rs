@@ -41,6 +41,11 @@ fn run_all(m: usize, n: usize, k: usize) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
     unsafe { gemm_smmla_blocked(m, n, mp, np, kp, &pa, &pb, &mut c_bl) };
     assert_eq!(c_bl, c_mm, "blocked SMMLA diverged at {}x{}x{}", m, n, k);
 
+    // Tiled SDOT must agree too - it is the fair opponent, so it must be correct.
+    let mut c_dt = vec![0i32; m * n];
+    unsafe { gemm_sdot_tiled(m, n, k, kp_dot, &a, &bt, &mut c_dt) };
+    assert_eq!(c_dt, c_ref, "tiled SDOT diverged at {}x{}x{}", m, n, k);
+
     // 8x8 tiling changes register allocation and edge handling, not arithmetic.
     let mut c88 = vec![0i32; m * n];
     unsafe { gemm_smmla_8x8(m, n, mp, np, kp, &pa, &pb, &mut c88) };
@@ -136,7 +141,7 @@ fn main() {
 
     println!("Throughput (GOPS = 2*M*N*K / s, higher is better)");
     println!("┌──────────────────┬──────────┬──────────┬──────────┬──────────┬─────────┐");
-    println!("│ M×N×K            │  scalar  │   SDOT   │  4x4     │  8x8     │ 8x8/4x4 │");
+    println!("│ M×N×K            │ SDOT 1x1 │ SDOT 4x4 │ MM 4x4   │  MM 8x8  │ MM/SDOT │");
     println!("├──────────────────┼──────────┼──────────┼──────────┼──────────┼─────────┤");
 
     for &(m, n, k) in &[
@@ -166,11 +171,14 @@ fn main() {
 
         let g88 = bench_one(
             || unsafe { gemm_smmla_8x8(m, n, mp, np, kp, &pa, &pb, &mut c) }, ops, 1.0);
+        let g_dt = bench_one(
+            || unsafe { gemm_sdot_tiled(m, n, k, k, &a, &bt, &mut c) }, ops, 1.0);
 
+        let _ = g_scalar;
         println!(
             "│ {:<16} │ {:>8.2} │ {:>8.2} │ {:>8.2} │ {:>8.2} │ {:>6.2}× │",
             format!("{}×{}×{}", m, n, k),
-            g_scalar, g_dot, g_mm, g88, g88 / g_mm
+            g_dot, g_dt, g_mm, g88, g88 / g_dt
         );
     }
     println!("└──────────────────┴──────────┴──────────┴──────────┴──────────┴─────────┘");
@@ -197,7 +205,8 @@ fn dispatch_demo() {
         let mut c = vec![0i32; m * n];
 
         let bt = pack_b_transposed(n, k, k, &b);
-        let g_dot = bench_one(|| unsafe { gemm_sdot(m, n, k, k, &a, &bt, &mut c) }, ops, 0.8);
+        let g_dot = bench_one(
+            || unsafe { gemm_sdot_tiled(m, n, k, k, &a, &bt, &mut c) }, ops, 0.8);
         let (pa, mp, kp) = pack_a_smmla(m, k, &a);
         let (pb, np) = pack_b_smmla(n, k, &b);
         let g_mm = bench_one(
@@ -245,6 +254,7 @@ fn scaling_demo() {
         for t in [1usize, 4, 8, 16] {
             let g_dot = bench_one(
                 || unsafe { gemm_sdot_mt(m, n, k, k, &a, &bt, &mut c, t) }, ops, 0.7);
+            let _ = &bt;
             let g_mm = bench_one(
                 || unsafe { gemm_smmla_mt(m, n, mp, np, kp, &pa, &pb, &mut c, t) }, ops, 0.7);
             println!(

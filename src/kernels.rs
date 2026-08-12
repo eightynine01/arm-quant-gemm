@@ -66,6 +66,77 @@ pub unsafe fn gemm_sdot(m: usize, n: usize, k: usize, kp: usize, a: &[i8], bt: &
     }
 }
 
+/// 4×4 register-tiled `SDOT` — the fair opponent for [`gemm_smmla_8x8`].
+///
+/// [`gemm_sdot`] computes one output element at a time: two loads, one `SDOT`.
+/// Comparing that against a tiled `SMMLA` measures tiling, not the instruction.
+/// This version loads four A rows and four B columns and issues sixteen `SDOT`s
+/// from them — the same 2 instructions per load as the 8×8 `SMMLA` kernel.
+///
+/// With both kernels tiled, the remaining difference should be close to the
+/// instruction ratio: `SDOT` does 16 MACs (4 lanes × 4), `SMMLA` does 32
+/// (2×2 output × 8 deep). Anything much beyond 2× would mean something else
+/// is going on.
+///
+/// # Safety
+/// Requires FEAT_DotProd. `bt` must be [`pack_b_transposed`] output with the same `kp`.
+#[target_feature(enable = "dotprod")]
+pub unsafe fn gemm_sdot_tiled(
+    m: usize, n: usize, k: usize, kp: usize, a: &[i8], bt: &[i8], c: &mut [i32],
+) {
+    let kb = k / 16 * 16;
+
+    let mut i0 = 0;
+    while i0 < m {
+        let mut j0 = 0;
+        while j0 < n {
+            let mut acc = [[vdupq_n_s32(0); 4]; 4];
+
+            // Clamp so pointers stay in bounds; out-of-range tiles are not stored.
+            let mut ap = [std::ptr::null::<i8>(); 4];
+            let mut bp = [std::ptr::null::<i8>(); 4];
+            for t in 0..4 {
+                ap[t] = a.as_ptr().add((i0 + t).min(m - 1) * k);
+                bp[t] = bt.as_ptr().add((j0 + t).min(n - 1) * kp);
+            }
+
+            let mut p = 0;
+            while p < kb {
+                let av = [
+                    vld1q_s8(ap[0].add(p)), vld1q_s8(ap[1].add(p)),
+                    vld1q_s8(ap[2].add(p)), vld1q_s8(ap[3].add(p)),
+                ];
+                let bv = [
+                    vld1q_s8(bp[0].add(p)), vld1q_s8(bp[1].add(p)),
+                    vld1q_s8(bp[2].add(p)), vld1q_s8(bp[3].add(p)),
+                ];
+                for r in 0..4 {
+                    for cc in 0..4 {
+                        acc[r][cc] = vdotq_s32(acc[r][cc], av[r], bv[cc]);
+                    }
+                }
+                p += 16;
+            }
+
+            for r in 0..4 {
+                for cc in 0..4 {
+                    let (i, j) = (i0 + r, j0 + cc);
+                    if i < m && j < n {
+                        let mut sum = vaddvq_s32(acc[r][cc]);
+                        for q in kb..k {
+                            sum += *a.as_ptr().add(i * k + q) as i32
+                                 * *bt.as_ptr().add(j * kp + q) as i32;
+                        }
+                        c[i * n + j] = sum;
+                    }
+                }
+            }
+            j0 += 4;
+        }
+        i0 += 4;
+    }
+}
+
 /// Pack A into 2-row × 8-deep tiles: `[row0 k0..k7, row1 k0..k7]` per 16 bytes.
 /// This is exactly the operand layout `SMMLA` expects.
 pub fn pack_a_smmla(m: usize, k: usize, a: &[i8]) -> (Vec<i8>, usize, usize) {
@@ -426,7 +497,7 @@ pub unsafe fn gemm_sdot_mt(
 ) {
     let nthreads = threads.max(1).min(n.max(1));
     if nthreads == 1 {
-        gemm_sdot(m, n, k, kp, a, bt, c);
+        gemm_sdot_tiled(m, n, k, kp, a, bt, c);
         return;
     }
     let chunk = n.div_ceil(nthreads);
@@ -449,28 +520,54 @@ pub unsafe fn gemm_sdot_mt(
     });
 }
 
+/// Column-range worker. Uses the same 4×4 register tiling as
+/// [`gemm_sdot_tiled`] so the threaded comparison stays fair.
 #[target_feature(enable = "dotprod")]
 unsafe fn sdot_colrange(
     m: usize, n: usize, k: usize, kp: usize,
     a: &[i8], bt: &[i8], c: &mut [i32], j0: usize, j1: usize,
 ) {
     let kb = k / 16 * 16;
-    for i in 0..m {
-        for j in j0..j1 {
-            let arow = a.as_ptr().add(i * k);
-            let brow = bt.as_ptr().add(j * kp);
-            let mut acc = vdupq_n_s32(0);
+    let mut i0 = 0;
+    while i0 < m {
+        let mut jj = j0;
+        while jj < j1 {
+            let mut acc = [[vdupq_n_s32(0); 4]; 4];
+            let mut ap = [std::ptr::null::<i8>(); 4];
+            let mut bp = [std::ptr::null::<i8>(); 4];
+            for t in 0..4 {
+                ap[t] = a.as_ptr().add((i0 + t).min(m - 1) * k);
+                bp[t] = bt.as_ptr().add((jj + t).min(j1 - 1) * kp);
+            }
             let mut p = 0;
             while p < kb {
-                acc = vdotq_s32(acc, vld1q_s8(arow.add(p)), vld1q_s8(brow.add(p)));
+                let av = [vld1q_s8(ap[0].add(p)), vld1q_s8(ap[1].add(p)),
+                          vld1q_s8(ap[2].add(p)), vld1q_s8(ap[3].add(p))];
+                let bv = [vld1q_s8(bp[0].add(p)), vld1q_s8(bp[1].add(p)),
+                          vld1q_s8(bp[2].add(p)), vld1q_s8(bp[3].add(p))];
+                for r in 0..4 {
+                    for cc in 0..4 {
+                        acc[r][cc] = vdotq_s32(acc[r][cc], av[r], bv[cc]);
+                    }
+                }
                 p += 16;
             }
-            let mut tail = vaddvq_s32(acc);
-            for q in kb..k {
-                tail += *arow.add(q) as i32 * *brow.add(q) as i32;
+            for r in 0..4 {
+                for cc in 0..4 {
+                    let (i, j) = (i0 + r, jj + cc);
+                    if i < m && j < j1 {
+                        let mut sum = vaddvq_s32(acc[r][cc]);
+                        for q in kb..k {
+                            sum += *a.as_ptr().add(i * k + q) as i32
+                                 * *bt.as_ptr().add(j * kp + q) as i32;
+                        }
+                        c[i * n + j] = sum;
+                    }
+                }
             }
-            c[i * n + j] = tail;
+            jj += 4;
         }
+        i0 += 4;
     }
 }
 
