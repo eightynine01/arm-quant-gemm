@@ -13,10 +13,15 @@ given it does twice the multiply-accumulate work per instruction that `SDOT` doe
 - **Round 3** — both tiled. `SMMLA` wins **1.1–1.5×**, and **loses 1.05–1.45× at M=1
   across every thread count.**
 
-Round 3 is the answer. Rounds 1 and 2 are in the repo because the distance between them
-is the point: **an instruction comparison measures whichever kernel you wrote worse.**
-The same pair of instructions produced a 0.79× regression, a 7.5× win, and a 1.1× edge,
-depending only on how much care went into each side.
+Round 3 is the answer, and it is corroborated: **llama.cpp already splits exactly this
+way** — 62 `SDOT` and zero `SMMLA` in its M=1 decode kernels, 39 `SMMLA` and zero `SDOT`
+in its batched ones (counted below).
+
+Rounds 1 and 2 are kept in the repo because the distance between them is the point:
+**an instruction comparison measures whichever kernel you wrote worse.** The same pair
+of instructions produced a 0.79× regression, a 7.5× win, and a 1.1× edge, decided
+entirely by how much care each side got. Round 2 — the one that looked best — was the
+most wrong.
 
 ## Results
 
@@ -107,6 +112,36 @@ The crossover sits at M=2 — the first M where `SMMLA`'s second row carries rea
 (At M=2 the table shows `SDOT` still ahead in raw GOPS; `SMMLA` is picked there because
 the gap has collapsed to the point where the batched trend takes over by M=4. A
 threshold of 4 would be defensible; 2 is where the structural waste ends.)
+
+## Independent confirmation: llama.cpp already splits exactly here
+
+The dispatch rule above was derived from measurement and from counting what the
+instruction wastes at M=1. It is not novel — and finding that out is the strongest
+evidence the method is sound.
+
+`llama.cpp` keeps two separate families of Arm int8 kernels: `ggml_gemv_*` for the
+M=1 decode path and `ggml_gemm_*` for batched prefill. Counting the intrinsics in
+`ggml/src/ggml-cpu/arch/arm/repack.cpp` at commit `89e0aa6` (2026-08-11):
+
+| path | `vdotq_s32` (SDOT) | `vmmlaq_s32` / `svmmla` (SMMLA) |
+|---|---:|---:|
+| `ggml_gemv_*` — decode, M=1 | **62** | **0** |
+| `ggml_gemm_*` — prefill, M>1 | **0** | **39** |
+
+The decode path does not merely prefer `SDOT`; it contains **zero**
+`__ARM_FEATURE_MATMUL_INT8` guards, so `SMMLA` is not compiled in there even on
+hardware that has it. The batched path is the mirror image.
+
+That is the same split this benchmark arrives at from first principles, reached
+independently by a heavily-tuned production runtime. Two consequences worth stating
+plainly:
+
+1. **The measurement methodology reproduces a real design decision.** A microbenchmark
+   that disagreed with llama.cpp here would more likely be wrong than llama.cpp.
+2. **There is no upstream bug to report.** I went looking for one — the honest result
+   is that this is already handled correctly, and the contribution of this repo is the
+   *quantified* version of a decision the ecosystem made qualitatively, plus the
+   demonstration of how easily an unfair kernel comparison inverts it.
 
 ## Correctness first
 
