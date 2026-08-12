@@ -87,8 +87,17 @@ extra waste, but it cannot beat an instruction that wastes nothing.
 M=1 is the LLM decode step: every token after the prompt is a matrix-vector product.
 Prefill runs once per prompt; decode runs once per token.
 
-Peak measured: **1364.5 GOPS** (SMMLA 8×8, 8 threads, M=8). Both kernels stop scaling
-past 8 threads and regress at 16 — bandwidth, not issue rate.
+Peak on this harness: **1364.5 GOPS** (SMMLA 8×8, 8 threads, M=8), with both
+kernels flattening past 8 threads and regressing at 16.
+
+**Both numbers in that sentence were artifacts, and the explanation that used to
+follow it — "bandwidth, not issue rate" — was wrong.** The table above creates
+fresh OS threads on every call, which turns out to be 43–62% of the wall clock
+at this size. Chased down in [Why 16 threads loses to 8](#why-16-threads-loses-to-8);
+on a persistent pool the peak is **2308 GOPS** and the regression does not exist.
+
+The table is kept as measured rather than quietly re-run, because the gap
+between it and the pooled numbers is the point.
 
 ## The rule
 
