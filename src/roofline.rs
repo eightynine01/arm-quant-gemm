@@ -6,36 +6,36 @@
 //! register-resident operands, with enough independent accumulators to hide
 //! latency. Whatever that reaches is the issue limit.
 //!
-//! That alone is a misleading denominator. A kernel far below the issue ceiling
-//! is not necessarily leaving anything on the table — it may be at its *memory*
-//! ceiling instead, and no amount of instruction scheduling would move it.
-//! Which ceiling applies is decided by arithmetic intensity, and for this GEMM
-//! the intensity has a closed form.
+//! One ceiling is not enough to place a kernel: a number far below the issue
+//! limit can mean wasted issue slots or it can mean the kernel is at its
+//! *memory* limit, where no amount of instruction scheduling would move it.
+//! Which one applies is decided by arithmetic intensity.
 //!
-//! Take an `m x n x k` product with an `mt`-row register tile. B is re-read once
-//! per block of `mt` rows, so B traffic is `(m/mt) * n * k` bytes against
-//! `2*m*n*k` ops:
+//! For an `m x n x k` product with an `mt x nt` register tile, A is re-read once
+//! per column block and B once per row block, so `2*m*n*k` ops ride on
+//! `m*n*k*(mt+nt)/(mt*nt)` bytes:
 //!
 //! ```text
-//!     intensity = 2*m*n*k / ((m/mt) * n * k) = 2 * mt   ops per byte
+//!     intensity = 2*mt*nt/(mt+nt)   ops per byte
 //! ```
 //!
-//! The shape cancels out. The 8x8 kernel is pinned at 16 ops/byte and the 4x4
-//! kernel at 8, whatever `m`, `n`, and `k` are. So the memory ceiling is just
-//! `bandwidth * 2 * mt` — and the useful bandwidth is whichever level of the
-//! hierarchy B actually lives in, which is why `stream_bandwidth` sweeps
-//! footprints instead of reporting one number.
+//! which is 8 for the 8x8 tile. At `m = 8` there is only one row block, so A is
+//! read once (32 KiB, negligible) and the figure rises to `2*mt` = 16.
+//! `stream_bandwidth` sweeps footprints rather than reporting one number,
+//! because the bandwidth that matters is whichever level of the hierarchy the B
+//! panel occupies.
 //!
-//! Note what this rules out. At `m = 8` with an 8-row tile, B is read exactly
-//! once; that is the floor, and no cache blocking can reduce it. Reaching for
-//! blocking there would be optimising traffic that is already minimal.
+//! **On this machine the memory ceiling is not the binding one.** It lands near
+//! 1240 GOPS against an issue ceiling of ~424, and the kernel sits at 85% of the
+//! issue ceiling — so this GEMM is issue-bound, not memory-bound. An earlier
+//! version of this file concluded the opposite, from an issue ceiling that was
+//! being measured far too high; the k-unroll built to exploit that conclusion
+//! moved nothing, which is what prompted the remeasurement.
 
 use std::arch::aarch64::*;
 use std::hint::black_box;
 use std::time::Instant;
 
-/// # Safety
-/// Requires FEAT_I8MM.
 /// Written in inline assembly, after four attempts in intrinsics all failed.
 ///
 /// The failures are worth naming because each produced a plausible number
@@ -62,7 +62,7 @@ use std::time::Instant;
 /// Requires FEAT_I8MM.
 #[target_feature(enable = "i8mm")]
 pub unsafe fn smmla_issue_ceiling(iters: u64) -> (f64, i32) {
-    let mut n = iters;
+    let n = iters;
     let t0 = Instant::now();
     core::arch::asm!(
         // 16 accumulators (v0-v15) and 8 operands (v16-v23), initialised
@@ -99,7 +99,8 @@ pub unsafe fn smmla_issue_ceiling(iters: u64) -> (f64, i32) {
         "smmla v14.4s, v19.16b, v20.16b", "smmla v15.4s, v21.16b, v22.16b",
         "subs {n}, {n}, #1",
         "b.ne 2b",
-        n = inout(reg) n,
+        // The counter is consumed by the loop; discard the output.
+        n = inout(reg) n => _,
         out("v0") _, out("v1") _, out("v2") _, out("v3") _,
         out("v4") _, out("v5") _, out("v6") _, out("v7") _,
         out("v8") _, out("v9") _, out("v10") _, out("v11") _,
@@ -192,7 +193,7 @@ pub fn stream_bandwidth(bytes: usize, iters: u64) -> (f64, i32) {
 /// Requires FEAT_DotProd.
 #[target_feature(enable = "dotprod")]
 pub unsafe fn sdot_issue_ceiling(iters: u64) -> (f64, i32) {
-    let mut n = iters;
+    let n = iters;
     let t0 = Instant::now();
     core::arch::asm!(
         "movi v0.4s, #0", "movi v1.4s, #0", "movi v2.4s, #0", "movi v3.4s, #0",
@@ -221,7 +222,8 @@ pub unsafe fn sdot_issue_ceiling(iters: u64) -> (f64, i32) {
         "sdot v14.4s, v19.16b, v20.16b", "sdot v15.4s, v21.16b, v22.16b",
         "subs {n}, {n}, #1",
         "b.ne 2b",
-        n = inout(reg) n,
+        // The counter is consumed by the loop; discard the output.
+        n = inout(reg) n => _,
         out("v0") _, out("v1") _, out("v2") _, out("v3") _,
         out("v4") _, out("v5") _, out("v6") _, out("v7") _,
         out("v8") _, out("v9") _, out("v10") _, out("v11") _,
