@@ -12,6 +12,9 @@ the repository owner. Disclosed per hackathon transparency rules.
   inline assembly.
 - `src/main.rs` — the verification harness and the benchmark loops.
 - `README.md` — drafted from the program's actual output.
+- `rust-toolchain.toml` — added after a fresh clone built with a default
+  stable toolchain failed on `#![feature]`; the pin makes the documented
+  command work without a `+nightly` override.
 
 Effectively all of the code in this repository was written by the AI.
 
